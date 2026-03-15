@@ -6,7 +6,7 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
 import numpy as np
 import supersuit as ss
 import torch
@@ -29,11 +29,11 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="cleanRL_ma",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-    parser.add_argument("--capture_video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
@@ -87,35 +87,85 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.network = nn.Sequential(
-            layer_init(nn.Conv2d(6, 32, 8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, 512)),
-            nn.ReLU(),
-        )
+        obs_shape = envs.single_observation_space.shape
+        
+        # Check if input is an image (3D) or vector (1D)
+        if len(obs_shape) == 3: # Atari / Surround
+            self.is_image = True
+            self.network = nn.Sequential(
+                layer_init(nn.Conv2d(obs_shape[2], 32, 8, stride=4)), # Adjusting for frame stack
+                nn.ReLU(),
+                layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+                nn.ReLU(),
+                nn.Flatten(),
+                layer_init(nn.Linear(64 * 7 * 7, 512)),
+                nn.ReLU(),
+            )
+        else: # MPE / Simple Spread
+            self.is_image = False
+            self.network = nn.Sequential(
+                layer_init(nn.Linear(np.array(obs_shape).prod(), 512)),
+                nn.ReLU(),
+                layer_init(nn.Linear(512, 512)),
+                nn.ReLU(),
+            )
+            
         self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(512, 1), std=1)
 
     def get_value(self, x):
-        x = x.clone()
-        x[:, :, :, [0, 1, 2, 3]] /= 255.0
-        return self.critic(self.network(x.permute((0, 3, 1, 2))))
+        if self.is_image:
+            x = x.clone() / 255.0
+            x = x.permute((0, 3, 1, 2))
+        return self.critic(self.network(x))
 
     def get_action_and_value(self, x, action=None):
-        x = x.clone()
-        x[:, :, :, [0, 1, 2, 3]] /= 255.0
-        hidden = self.network(x.permute((0, 3, 1, 2)))
+        if self.is_image:
+            x = x.clone() / 255.0
+            x = x.permute((0, 3, 1, 2))
+        hidden = self.network(x)
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
+# 1. Base Environment Factory
+def make_env(env_id):
+    def thunk():
+        if "simple_spread" in env_id:
+            from mpe2 import simple_spread_v3
+            env = simple_spread_v3.parallel_env(render_mode="rgb_array")
+        else:
+            env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
+            env = ss.max_observation_v0(env, 2)
+            env = ss.frame_skip_v0(env, 4)
+            env = ss.color_reduction_v0(env, mode="B")
+            env = ss.resize_v1(env, x_size=84, y_size=84)
+
+        env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
+        env = ss.frame_stack_v1(env, 4)
+        env = ss.agent_indicator_v0(env, type_only=False)
+        env = ss.pettingzoo_env_to_vec_env_v1(env)
+        
+        class InternalShim(gym.Env):
+            def __init__(self, env):
+                self.env = env
+                self.num_envs = env.num_envs 
+                self.observation_space = env.observation_space
+                self.action_space = env.action_space
+            def reset(self, seed=None, options=None):
+                return self.env.reset(seed=seed, options=options)[0], {}
+            def step(self, actions):
+                # Unpack 5 values; return a dict with flat keys
+                obs, rew, term, trunc, info = self.env.step(actions)
+                return np.array(obs), rew, term, trunc, info 
+            def render(self): return self.env.render()
+            def close(self): return self.env.close()
+        return InternalShim(env)
+    return thunk
 
 if __name__ == "__main__":
     args = parse_args()
@@ -146,42 +196,97 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
-    env = importlib.import_module(f"pettingzoo.atari.{args.env_id}").parallel_env()
-    env = ss.max_observation_v0(env, 2)
-    env = ss.frame_skip_v0(env, 4)
-    env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-    env = ss.color_reduction_v0(env, mode="B")
-    env = ss.resize_v1(env, x_size=84, y_size=84)
-    env = ss.frame_stack_v1(env, 4)
-    env = ss.agent_indicator_v0(env, type_only=False)
-    env = ss.pettingzoo_env_to_vec_env_v1(env)
-    envs = ss.concat_vec_envs_v1(env, args.num_envs // 2, num_cpus=0, base_class="gym")
-    envs.single_observation_space = envs.observation_space
-    envs.single_action_space = envs.action_space
-    envs.is_vector_env = True
-    envs = gym.wrappers.RecordEpisodeStatistics(envs)
+    # 2. Metadata Extraction
+    temp_env = make_env(args.env_id)()
+    num_agents_per_game = temp_env.num_envs 
+    single_action_space = temp_env.action_space 
+    single_observation_space = temp_env.observation_space
+    temp_env.close()
+
+    # 3. Vectorization
+    num_games = args.num_envs // num_agents_per_game
+    envs = ss.concat_vec_envs_v1(make_env(args.env_id)(), num_games, num_cpus=0, base_class="gymnasium")
+
+    # 4. THE BROADCAST SHIM: Explicitly formatted for Gymnasium Wrappers
+    class BroadcastShim(gym.vector.VectorEnv):
+        def __init__(self, env):
+            self.env = env
+            self.num_envs = env.num_envs
+            self.observation_space = env.observation_space
+            self.action_space = env.action_space
+            self.render_mode = "rgb_array"
+            self.metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
+            self._is_vector_env = True
+        
+        def reset(self, seed=None, options=None):
+            obs, info = self.env.reset(seed=seed, options=options)
+            return obs, self._convert_info(info)
+            
+        def step(self, actions):
+            obs, rew, term, trunc, info = self.env.step(actions)
+            # Ensure signals are numpy arrays of booleans for RecordEpisodeStatistics
+            term = np.array(term, dtype=bool)
+            trunc = np.array(trunc, dtype=bool)
+            return obs, rew, term, trunc, self._convert_info(info)
+
+        def _convert_info(self, info_in):
+            # Flatten list of dicts into a dict of lists
+            new_info = {}
+            if isinstance(info_in, list):
+                for i, agent_info in enumerate(info_in):
+                    for k, v in agent_info.items():
+                        if k not in new_info: new_info[k] = [None] * self.num_envs
+                        new_info[k][i] = v
+            return new_info
+
+        def render(self):
+            # Tiling frame to match actual_num_envs prevents 1-frame video bug
+            frame = self.env.render()
+            return [frame for _ in range(self.num_envs)]
+            
+        def close(self): return self.env.close()
+
+    envs = BroadcastShim(envs)
+    actual_num_envs = envs.num_envs
+
+    # 5. Apply Wrappers in strict order
+    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     if args.capture_video:
-        envs = gym.wrappers.RecordVideo(envs, f"videos/{run_name}")
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+        # Triggering more frequently to ensure you see progress immediately
+        envs = gym.wrappers.vector.RecordVideo(
+            envs, video_folder=f"videos/{run_name}", 
+            episode_trigger=lambda x: True # Record EVERY episode for now to verify fix
+        )
+
+    # 6. Final CleanRL attributes
+    envs.single_action_space = single_action_space
+    envs.single_observation_space = single_observation_space
+    envs.is_vector_env = True
+    
+    args.batch_size = int(actual_num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    num_updates = args.total_timesteps // args.batch_size
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, actual_num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((args.num_steps, actual_num_envs)).to(device)
+    rewards = torch.zeros((args.num_steps, actual_num_envs)).to(device)
+    dones = torch.zeros((args.num_steps, actual_num_envs)).to(device)
+    values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
-    num_updates = args.total_timesteps // args.batch_size
+    reset_data = envs.reset()
+    if isinstance(reset_data, tuple):
+        next_obs = torch.Tensor(reset_data[0]).to(device)
+    else:
+        next_obs = torch.Tensor(reset_data).to(device)
+    next_done = torch.zeros(actual_num_envs).to(device)
 
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.
@@ -191,7 +296,7 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
-            global_step += 1 * args.num_envs
+            global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
 
@@ -203,16 +308,25 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, done, info = envs.step(action.cpu().numpy())
+            step_data = envs.step(action.cpu().numpy())
+    
+            # Gymnasium step returns (obs, reward, terminations, truncations, infos)
+            if len(step_data) == 5:
+                next_obs, reward, terminations, truncations, info = step_data
+                done = np.logical_or(terminations, truncations) # Combine for PPO
+            else:
+                next_obs, reward, done, info = step_data
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
-            for idx, item in enumerate(info):
-                player_idx = idx % 2
-                if "episode" in item.keys():
-                    print(f"global_step={global_step}, {player_idx}-episodic_return={item['episode']['r']}")
-                    writer.add_scalar(f"charts/episodic_return-player{player_idx}", item["episode"]["r"], global_step)
-                    writer.add_scalar(f"charts/episodic_length-player{player_idx}", item["episode"]["l"], global_step)
+            # MANUAL TEAM TRACKING
+            if "final_info" in info:
+                for idx, item in enumerate(info["final_info"]):
+                    if item is not None and "episode" in item:
+                        # item['episode']['r'] is the total return for ONE GAME
+                        writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
+                        writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
+                        break # We break because in MPE, all agents in one game share the same return
 
         # bootstrap value if not done
         with torch.no_grad():
