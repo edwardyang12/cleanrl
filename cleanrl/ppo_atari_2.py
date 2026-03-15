@@ -53,7 +53,7 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 64
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -63,7 +63,7 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 8
+    num_minibatches: int = 16
     """the number of mini-batches"""
     update_epochs: int = 4
     """the K epochs to update the policy"""
@@ -116,13 +116,28 @@ def make_env(env_id, idx, capture_video, run_name):
         
         if "FIRE" in env.unwrapped.get_action_meanings():
             env = FireResetEnv(env)
+        
+        new_repo_space = gym.spaces.Box(
+                low=0, 
+                high=255, 
+                shape=(110, 160, 3), 
+                dtype=env.observation_space.dtype
+            )
 
-        env = gym.wrappers.NormalizeReward(env)  
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))  
+        env = gym.wrappers.TransformObservation(
+            env, 
+            lambda obs: obs[34:-16, :, :], 
+            observation_space=new_repo_space
+        )
+        # env = gym.wrappers.NormalizeReward(env)  
+        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        # env = PongEnhancedRewardWrapper(env, contact_reward=0.02, time_penalty=-0.002)
+        # env = PongAggressionWrapper(env, penalty=-0.001)
+        env = gym.wrappers.ResizeObservation(env, (110, 110))
         env = gym.wrappers.GrayscaleObservation(env)
         env = gym.wrappers.FrameStackObservation(env, 4)
+        # env = PongActionWrapper(env)
         return env
 
     return thunk
@@ -132,6 +147,61 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
+class PongActionWrapper(gym.ActionWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # 0: Stay (0), 1: Up (2), 2: Down (3)
+        self.mapping = {0: 0, 1: 2, 2: 3}
+        self.action_space = gym.spaces.Discrete(3)
+
+    def action(self, action):
+        return self.mapping[action]
+
+class PongEnhancedRewardWrapper(gym.Wrapper):
+    def __init__(self, env, contact_reward=0.1, time_penalty=-0.001):
+        super().__init__(env)
+        self.contact_reward = contact_reward
+        self.time_penalty = time_penalty
+        self.last_ball_x = 0
+        self.was_moving_towards_player = False
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        
+        # 1. Aggression Bonus: Small penalty every frame the ball is in play
+        if reward == 0 and not (terminated or truncated):
+            reward += self.time_penalty
+            
+        # 2. Contact Reward: Use RAM index 12 (Ball X-position)
+        # Player is on the right side in Pong. Ball X increases as it moves right.
+        ram = self.env.unwrapped.ale.getRAM()
+        ball_x = int(ram[12])
+        
+        moving_towards_player = (ball_x > self.last_ball_x)
+        
+        # Check for direction change (hit) on the player's side (X > 180)
+        if self.was_moving_towards_player and not moving_towards_player and ball_x > 180:
+            if reward <= 0: # Only add if we didn't just score a point
+                reward += self.contact_reward
+                
+        self.last_ball_x = ball_x
+        self.was_moving_towards_player = moving_towards_player
+        
+        return obs, reward, terminated, truncated, info
+
+class PongAggressionWrapper(gym.Wrapper):
+    def __init__(self, env, penalty=-0.001):
+        super().__init__(env)
+        self.penalty = penalty
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        # Apply penalty ONLY if it's a standard frame (reward is 0)
+        # This prevents the penalty from being turned into -1 by ClipRewardEnv
+        if reward == 0 and not (terminated or truncated):
+            reward = self.penalty
+        return obs, reward, terminated, truncated, info
 
 
 class Agent(nn.Module):
@@ -145,7 +215,7 @@ class Agent(nn.Module):
             layer_init(nn.Conv2d(64, 64, 3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
-            layer_init(nn.Linear(64 * 7 * 7, 512)),
+            layer_init(nn.Linear(64 * 10 * 10, 512)),
             nn.ReLU(),
         )
         self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
@@ -161,6 +231,47 @@ class Agent(nn.Module):
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+
+# class Agent(nn.Module):
+#     def __init__(self, envs):
+#         super().__init__()
+#         self.num_actions = envs.single_action_space.n
+        
+#         # Shared CNN: The Actor's exploration "seeds" features for the Critic
+#         self.network = nn.Sequential(
+#             layer_init(nn.Conv2d(4, 32, 8, stride=4)), nn.ReLU(),
+#             layer_init(nn.Conv2d(32, 64, 4, stride=2)), nn.ReLU(),
+#             layer_init(nn.Conv2d(64, 64, 3, stride=1)), nn.ReLU(),
+#             nn.Flatten(),
+#         )
+        
+#         # Separate heads start here to prevent gradient interference
+#         self.actor_fc = nn.Sequential(layer_init(nn.Linear(64 * 10 * 10, 512)), nn.ReLU())
+#         self.critic_fc = nn.Sequential(layer_init(nn.Linear(64 * 10 * 10, 512)), nn.ReLU())
+
+#         input_dim = 512
+#         self.actor_head = layer_init(nn.Linear(input_dim, self.num_actions), std=0.01)
+#         self.critic_head = layer_init(nn.Linear(input_dim, 1), std=1)
+
+#     def get_action_and_value(self, x, action=None):
+#         shared_features = self.network(x / 255.0)
+        
+#         # Split logic
+#         a_hidden = self.actor_fc(shared_features)
+#         c_hidden = self.critic_fc(shared_features)
+                
+#         logits = self.actor_head(a_hidden)
+#         probs = Categorical(logits=logits)
+#         if action is None:
+#             action = probs.sample()
+            
+#         value = self.critic_head(c_hidden)
+#         return action, probs.log_prob(action), probs.entropy(), value
+
+#     def get_value(self, x):
+#         shared_features = self.network(x / 255.0)
+#         c_hidden = self.critic_fc(shared_features)
+#         return self.critic_head(c_hidden)
 
 
 if __name__ == "__main__":
