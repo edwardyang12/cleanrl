@@ -144,27 +144,13 @@ def make_env(env_id):
             env = ss.frame_skip_v0(env, 4)
             env = ss.color_reduction_v0(env, mode="B")
             env = ss.resize_v1(env, x_size=84, y_size=84)
-
-        env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
+            env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
         env = ss.frame_stack_v1(env, 4)
         env = ss.agent_indicator_v0(env, type_only=False)
-        env = ss.pettingzoo_env_to_vec_env_v1(env)
         
-        class InternalShim(gym.Env):
-            def __init__(self, env):
-                self.env = env
-                self.num_envs = env.num_envs 
-                self.observation_space = env.observation_space
-                self.action_space = env.action_space
-            def reset(self, seed=None, options=None):
-                return self.env.reset(seed=seed, options=options)[0], {}
-            def step(self, actions):
-                # Unpack 5 values; return a dict with flat keys
-                obs, rew, term, trunc, info = self.env.step(actions)
-                return np.array(obs), rew, term, trunc, info 
-            def render(self): return self.env.render()
-            def close(self): return self.env.close()
-        return InternalShim(env)
+        # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
+        env = ss.pettingzoo_env_to_vec_env_v1(env)
+        return env
     return thunk
 
 if __name__ == "__main__":
@@ -196,19 +182,19 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # 2. Metadata Extraction
+    # 2. Extract single-agent metadata
     temp_env = make_env(args.env_id)()
     num_agents_per_game = temp_env.num_envs 
     single_action_space = temp_env.action_space 
     single_observation_space = temp_env.observation_space
     temp_env.close()
 
-    # 3. Vectorization
+    # 3. Create Parallel Games via SuperSuit's Native Concatenator
     num_games = args.num_envs // num_agents_per_game
     envs = ss.concat_vec_envs_v1(make_env(args.env_id)(), num_games, num_cpus=0, base_class="gymnasium")
 
-    # 4. THE BROADCAST SHIM: Explicitly formatted for Gymnasium Wrappers
-    class BroadcastShim(gym.vector.VectorEnv):
+    # 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
+    class DictInfoWrapper(gym.vector.VectorEnv):
         def __init__(self, env):
             self.env = env
             self.num_envs = env.num_envs
@@ -217,48 +203,49 @@ if __name__ == "__main__":
             self.render_mode = "rgb_array"
             self.metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
             self._is_vector_env = True
-        
+
+        def step(self, action):
+            obs, rew, term, trunc, info = self.env.step(action)
+            # Force info to be a dictionary to prevent the 'list' AttributeError
+            if isinstance(info, list):
+                info = {"agents": info}
+            return obs, rew, term, trunc, info
+            
         def reset(self, seed=None, options=None):
             obs, info = self.env.reset(seed=seed, options=options)
-            return obs, self._convert_info(info)
+            # Force info to be a dictionary on reset as well
+            if isinstance(info, list):
+                info = {"agents": info}
+            return obs, info
             
-        def step(self, actions):
-            obs, rew, term, trunc, info = self.env.step(actions)
-            # Ensure signals are numpy arrays of booleans for RecordEpisodeStatistics
-            term = np.array(term, dtype=bool)
-            trunc = np.array(trunc, dtype=bool)
-            return obs, rew, term, trunc, self._convert_info(info)
-
-        def _convert_info(self, info_in):
-            # Flatten list of dicts into a dict of lists
-            new_info = {}
-            if isinstance(info_in, list):
-                for i, agent_info in enumerate(info_in):
-                    for k, v in agent_info.items():
-                        if k not in new_info: new_info[k] = [None] * self.num_envs
-                        new_info[k][i] = v
-            return new_info
-
         def render(self):
-            # Tiling frame to match actual_num_envs prevents 1-frame video bug
-            frame = self.env.render()
-            return [frame for _ in range(self.num_envs)]
+            frames = self.env.render()
+            # Prevent 1-frame video crash by ensuring frame length matches actual_num_envs
+            if not isinstance(frames, list) or len(frames) != self.num_envs:
+                frames = [frames] * self.num_envs
+            return frames
             
-        def close(self): return self.env.close()
+        def close(self): 
+            return self.env.close()
 
-    envs = BroadcastShim(envs)
+    envs = DictInfoWrapper(envs)
+
+    # Patch final cleanRL attributes
+    envs.is_vector_env = True
+    envs.single_action_space = single_action_space
+    envs.single_observation_space = single_observation_space
     actual_num_envs = envs.num_envs
 
-    # 5. Apply Wrappers in strict order
+    # 5. Apply Wrappers (Now safely receiving the expected Dict format and Vector type)
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     if args.capture_video:
-        # Triggering more frequently to ensure you see progress immediately
         envs = gym.wrappers.vector.RecordVideo(
-            envs, video_folder=f"videos/{run_name}", 
-            episode_trigger=lambda x: True # Record EVERY episode for now to verify fix
+            envs, 
+            f"videos/{run_name}", 
+            episode_trigger=lambda x: x % 100 == 0
         )
 
-    # 6. Final CleanRL attributes
+    # 6. Set Final CleanRL attributes
     envs.single_action_space = single_action_space
     envs.single_observation_space = single_observation_space
     envs.is_vector_env = True
@@ -319,14 +306,22 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
-            # MANUAL TEAM TRACKING
+            # LOGGING TEAM DATA
             if "final_info" in info:
-                for idx, item in enumerate(info["final_info"]):
+                # Standard Gymnasium / SyncVectorEnv format
+                for item in info["final_info"]:
                     if item is not None and "episode" in item:
-                        # item['episode']['r'] is the total return for ONE GAME
-                        writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
-                        break # We break because in MPE, all agents in one game share the same return
+                        writer.add_scalar("charts/team_episodic_return", item["episode"]["r"], global_step)
+                        writer.add_scalar("charts/team_episodic_length", item["episode"]["l"], global_step)
+                        break 
+            elif "_episode" in info:
+                # gym.wrappers.vector.RecordEpisodeStatistics format
+                for i, done in enumerate(info["_episode"]):
+                    if done:
+                        # Extract the return from the arrays
+                        writer.add_scalar("charts/team_episodic_return", info["episode"]["r"][i], global_step)
+                        writer.add_scalar("charts/team_episodic_length", info["episode"]["l"][i], global_step)
+                        break # Break after first item since all agents in one game share the reward
 
         # bootstrap value if not done
         with torch.no_grad():
