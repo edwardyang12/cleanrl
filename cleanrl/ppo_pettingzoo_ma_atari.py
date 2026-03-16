@@ -41,19 +41,21 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=20000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
+    parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=16,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=128,
+    parser.add_argument("--num-steps", type=int, default=512,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="Toggle learning rate annealing for policy and value networks")
+    parser.add_argument("--anneal-ent", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=4,
+    parser.add_argument("--num-minibatches", type=int, default=16,
         help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=4,
         help="the K epochs to update the policy")
@@ -63,7 +65,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=0.01,
+    parser.add_argument("--ent-coef", type=float, default=0.05,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
@@ -103,17 +105,23 @@ class Agent(nn.Module):
                 layer_init(nn.Linear(64 * 7 * 7, 512)),
                 nn.ReLU(),
             )
+            self.is_image = True
         else: # MPE / Simple Spread
             self.is_image = False
             self.network = nn.Sequential(
                 layer_init(nn.Linear(np.array(obs_shape).prod(), 512)),
+                nn.LayerNorm(512), # Stabilizes coordinate inputs
                 nn.ReLU(),
                 layer_init(nn.Linear(512, 512)),
+                nn.LayerNorm(512),
+                nn.ReLU(),
+                layer_init(nn.Linear(512, 256)), # Extra layer for coordination complexity
                 nn.ReLU(),
             )
             
-        self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+        self.actor = layer_init(nn.Linear(256 if not self.is_image else 512, 
+                                          envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(256 if not self.is_image else 512, 1), std=1)
 
     def get_value(self, x):
         if self.is_image:
@@ -137,7 +145,7 @@ def make_env(env_id):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=5, max_cycles=50, dynamic_rescaling=True, render_mode="rgb_array")
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
             env = ss.max_observation_v0(env, 2)
@@ -201,7 +209,7 @@ if __name__ == "__main__":
             self.observation_space = env.observation_space
             self.action_space = env.action_space
             self.render_mode = "rgb_array"
-            self.metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
+            self.metadata = {"render_modes": ["rgb_array"], "render_fps": 5}
             self._is_vector_env = True
 
         def step(self, action):
@@ -242,7 +250,7 @@ if __name__ == "__main__":
         envs = gym.wrappers.vector.RecordVideo(
             envs, 
             f"videos/{run_name}", 
-            episode_trigger=lambda x: x % 100 == 0
+            episode_trigger=lambda x: x % 1000 == 0
         )
 
     # 6. Set Final CleanRL attributes
@@ -279,8 +287,19 @@ if __name__ == "__main__":
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
-            lrnow = frac * args.learning_rate
+            lrnow = max(5e-5, frac * args.learning_rate)
             optimizer.param_groups[0]["lr"] = lrnow
+
+        if args.anneal_ent:
+            # Scale from start_ent down to 0 over the first 80% of training
+            # Then hold at 0 for the final 20% to "harden" the policy
+            progress = (update - 1.0) / num_updates
+            if progress < 0.8:
+                ent_coef_now = max(5e-4, args.ent_coef * (1.0 - progress / 0.8))
+            else:
+                ent_coef_now = 5e-4
+        else:
+            ent_coef_now = args.ent_coef
 
         for step in range(0, args.num_steps):
             global_step += actual_num_envs
@@ -311,6 +330,8 @@ if __name__ == "__main__":
                 # Standard Gymnasium / SyncVectorEnv format
                 for item in info["final_info"]:
                     if item is not None and "episode" in item:
+                        r = item["episode"]["r"]
+                        print(f"global_step={global_step}, episodic_return={r}")
                         writer.add_scalar("charts/team_episodic_return", item["episode"]["r"], global_step)
                         writer.add_scalar("charts/team_episodic_length", item["episode"]["l"], global_step)
                         break 
@@ -318,6 +339,8 @@ if __name__ == "__main__":
                 # gym.wrappers.vector.RecordEpisodeStatistics format
                 for i, done in enumerate(info["_episode"]):
                     if done:
+                        r = info["episode"]["r"][i]
+                        print(f"global_step={global_step}, episodic_return={r}")
                         # Extract the return from the arrays
                         writer.add_scalar("charts/team_episodic_return", info["episode"]["r"][i], global_step)
                         writer.add_scalar("charts/team_episodic_length", info["episode"]["l"][i], global_step)
@@ -391,7 +414,7 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
