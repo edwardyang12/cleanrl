@@ -85,6 +85,32 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+class ObservationNormalizer(nn.Module):
+    def __init__(self, shape, epsilon=1e-5):
+        super().__init__()
+        self.register_buffer("running_mean", torch.zeros(shape))
+        self.register_buffer("running_var", torch.ones(shape))
+        self.count = epsilon
+
+    def update(self, x):
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0)
+        batch_count = x.shape[0]
+
+        # Update running mean and variance using Welford's algorithm
+        delta = batch_mean - self.running_mean
+        new_mean = self.running_mean + delta * batch_count / (self.count + batch_count)
+        m_a = self.running_var * self.count
+        m_b = batch_var * batch_count
+        m_2 = m_a + m_b + delta**2 * self.count * batch_count / (self.count + batch_count)
+        
+        self.running_mean = new_mean
+        self.running_var = m_2 / (self.count + batch_count)
+        self.count += batch_count
+
+    def normalize(self, x):
+        return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
+
 class ValueNormalizer(nn.Module):
     def __init__(self, epsilon=1e-5):
         super().__init__()
@@ -166,6 +192,7 @@ class Agent(nn.Module):
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
         self.value_normalizer = ValueNormalizer()
+        self.obs_normalizer = ObservationNormalizer(self.obs_dim)
 
         # DECENTRALIZED ACTOR: Only sees individual observation
         self.actor_encoder = nn.Sequential(
@@ -186,28 +213,27 @@ class Agent(nn.Module):
             layer_init(nn.Linear(512, 256)),
             nn.ReLU(),
         )
-        self.critic = layer_init(nn.Linear(256, 1), std=1)
+        self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
 
     def get_value(self, x, denormalize=False):
-        # x shape: [total_agents_across_all_envs, obs_dim]
-        # We must group observations by "game" to centralize
         batch_size = x.shape[0]
+        x = self.obs_normalizer.normalize(x)
         num_games = batch_size // self.num_agents
-        
-        # Reshape to [num_games, num_agents * obs_dim]
         centralized_obs = x.view(num_games, self.num_agents * self.obs_dim)
         
-        # The critic produces 1 value per game, but PPO expects 1 value per agent.
-        # We repeat the game-value for each agent in that game.
-        game_values = self.critic(self.critic_encoder(centralized_obs)) # [num_games, 1]
+        # Now returns [num_games, num_agents]
+        all_agent_values = self.critic(self.critic_encoder(centralized_obs)) 
+        
         if denormalize:
-            game_values = self.value_normalizer.denormalize(game_values)
+            all_agent_values = self.value_normalizer.denormalize(all_agent_values)
     
-        return game_values.repeat_interleave(self.num_agents, dim=0) # [total_agents, 1]
+        # Flatten back to [total_agents, 1] so each agent has its OWN value prediction
+        return all_agent_values.view(-1, 1)
 
     def get_action_and_value(self, x, action=None, denormalize=False):
         # Actor remains decentralized (independent processing)
-        actor_hidden = self.actor_encoder(x)
+        x_norm = self.obs_normalizer.normalize(x)
+        actor_hidden = self.actor_encoder(x_norm)
         logits = self.actor(actor_hidden)
         probs = Categorical(logits=logits)
         
@@ -215,6 +241,24 @@ class Agent(nn.Module):
             action = probs.sample()
             
         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, denormalize)
+
+class StateWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # Simple Spread state size is roughly N*6 (pos, vel, etc.)
+        self.state_space = gym.spaces.Box(low=-np.inf, high=np.inf, 
+                                          shape=env.unwrapped.state().shape)
+
+    def step(self, action):
+        obs, rew, term, trunc, info = self.env.step(action)
+        # Inject global state into info for storage
+        info["global_state"] = self.env.unwrapped.state()
+        return obs, rew, term, trunc, info
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        info["global_state"] = self.env.unwrapped.state()
+        return obs, info
 
 # 1. Base Environment Factory
 def make_env(env_id):
@@ -351,6 +395,9 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
 
+    state_dim = temp_env.unwrapped.state().shape[0]
+    states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
+
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
@@ -457,6 +504,7 @@ if __name__ == "__main__":
         joint_inds = np.arange(num_joint_steps)
 
         agent.value_normalizer.update(b_returns)
+        agent.obs_normalizer.update(b_obs)
         for epoch in range(args.update_epochs):
             np.random.shuffle(joint_inds)
             for start in range(0, num_joint_steps, args.minibatch_size // agent.num_agents):
