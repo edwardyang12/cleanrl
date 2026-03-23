@@ -15,6 +15,7 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+from pettingzoo.utils.wrappers import BaseParallelWrapper
 
 def parse_args():
     # fmt: off
@@ -39,7 +40,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=20000000,
+    parser.add_argument("--total-timesteps", type=int, default=40000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -53,7 +54,7 @@ def parse_args():
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.90,
+    parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=16,
         help="the number of mini-batches")
@@ -186,13 +187,15 @@ class ValueNormalizer(nn.Module):
 #         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 class Agent(nn.Module):
-    def __init__(self, envs, num_agents):
+    def __init__(self, envs, num_agents, state_dim):
         super().__init__()
         self.num_agents = num_agents
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
         self.value_normalizer = ValueNormalizer()
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+        self.state_normalizer = ObservationNormalizer(state_dim)
+        
 
         # DECENTRALIZED ACTOR: Only sees individual observation
         self.actor_encoder = nn.Sequential(
@@ -204,10 +207,12 @@ class Agent(nn.Module):
         )
         self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
 
+        concatenated_obs_dim = self.num_agents * self.obs_dim
+        self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
         # CENTRALIZED CRITIC: Sees observations of ALL agents in the game
         # Input size = obs_dim * num_agents
         self.critic_encoder = nn.Sequential(
-            layer_init(nn.Linear(self.obs_dim * self.num_agents, 512)),
+            layer_init(nn.Linear(state_dim, 512)),
             nn.LayerNorm(512),
             nn.ReLU(),
             layer_init(nn.Linear(512, 256)),
@@ -215,57 +220,68 @@ class Agent(nn.Module):
         )
         self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
 
-    def get_value(self, x, denormalize=False):
-        batch_size = x.shape[0]
-        x = self.obs_normalizer.normalize(x)
-        num_games = batch_size // self.num_agents
-        centralized_obs = x.view(num_games, self.num_agents * self.obs_dim)
+    def get_value(self, x, centralized_state=None, denormalize=False):
+        # NORMALIZE the local obs for actors, but we need the STATE for critic
+        x_norm = self.obs_normalizer.normalize(x)
         
-        # Now returns [num_games, num_agents]
-        all_agent_values = self.critic(self.critic_encoder(centralized_obs)) 
+        if centralized_state is None:
+            # Fallback for rollout: Reshape local observations into a "proxy" state
+            batch_size = x.shape[0]
+            num_games = batch_size // self.num_agents
+            proxy_state = x_norm.view(num_games, -1)
+            centralized_state = self.critic_projection(proxy_state)
+        else:
+            # Training: Use the True Global State buffer
+            centralized_state = self.state_normalizer.normalize(centralized_state)
+
+        all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
         
         if denormalize:
             all_agent_values = self.value_normalizer.denormalize(all_agent_values)
-    
-        # Flatten back to [total_agents, 1] so each agent has its OWN value prediction
         return all_agent_values.view(-1, 1)
 
-    def get_action_and_value(self, x, action=None, denormalize=False):
-        # Actor remains decentralized (independent processing)
+    def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x)
         actor_hidden = self.actor_encoder(x_norm)
-        logits = self.actor(actor_hidden)
-        probs = Categorical(logits=logits)
+        probs = Categorical(logits=self.actor(actor_hidden))
         
         if action is None:
             action = probs.sample()
             
-        return action, probs.log_prob(action), probs.entropy(), self.get_value(x, denormalize)
+        # Pass the centralized_state down to get_value
+        return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
 
-class StateWrapper(gym.Wrapper):
+class StateWrapper(BaseParallelWrapper):
     def __init__(self, env):
         super().__init__(env)
-        # Simple Spread state size is roughly N*6 (pos, vel, etc.)
-        self.state_space = gym.spaces.Box(low=-np.inf, high=np.inf, 
-                                          shape=env.unwrapped.state().shape)
+        # Calculate and store state_space so it persists after vectorization
+        self.state_space = gym.spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=self.env.unwrapped.state().shape
+        )
 
-    def step(self, action):
-        obs, rew, term, trunc, info = self.env.step(action)
-        # Inject global state into info for storage
-        info["global_state"] = self.env.unwrapped.state()
-        return obs, rew, term, trunc, info
+    def step(self, actions):
+        obs, rews, terms, truncs, infos = self.env.step(actions)
+        state = self.env.unwrapped.state()
+        for agent in self.agents:
+            infos[agent]["global_state"] = state
+        return obs, rews, terms, truncs, infos
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        info["global_state"] = self.env.unwrapped.state()
-        return obs, info
+    def reset(self, seed=None, options=None):
+        obs, infos = self.env.reset(seed=seed, options=options)
+        state = self.env.unwrapped.state()
+        for agent in self.agents:
+            infos[agent]["global_state"] = state
+        return obs, infos
 
 # 1. Base Environment Factory
 def make_env(env_id):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=5, max_cycles=50, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, dynamic_rescaling=True, render_mode="rgb_array")
+            env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
             env = ss.max_observation_v0(env, 2)
@@ -334,16 +350,20 @@ if __name__ == "__main__":
 
         def step(self, action):
             obs, rew, term, trunc, info = self.env.step(action)
-            # Force info to be a dictionary to prevent the 'list' AttributeError
+            # SuperSuit's concat_vec_envs returns a list of agent info dicts
             if isinstance(info, list):
-                info = {"agents": info}
+                # Flatten the info for Gymnasium wrappers while preserving our custom key
+                # Extract global_state from the first agent's info to the top level
+                global_state_list = [i.get("global_state") for i in info]
+                info = {"global_state": np.array(global_state_list), "agents": info}
             return obs, rew, term, trunc, info
             
         def reset(self, seed=None, options=None):
             obs, info = self.env.reset(seed=seed, options=options)
-            # Force info to be a dictionary on reset as well
             if isinstance(info, list):
-                info = {"agents": info}
+                # Promote global_state to top level exactly like in step()
+                global_state_list = [i.get("global_state") for i in info]
+                info = {"global_state": np.array(global_state_list), "agents": info}
             return obs, info
             
         def render(self):
@@ -370,7 +390,7 @@ if __name__ == "__main__":
         envs = gym.wrappers.vector.RecordVideo(
             envs, 
             f"videos/{run_name}", 
-            episode_trigger=lambda x: x % 1000 == 0
+            episode_trigger=lambda x: x % 2000 == 0
         )
 
     # 6. Set Final CleanRL attributes
@@ -380,10 +400,31 @@ if __name__ == "__main__":
     
     args.batch_size = int(actual_num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    num_updates = args.total_timesteps // args.batch_size
+    num_updates = args.total_timesteps // args.batch_size    
+
+    # TRY NOT TO MODIFY: start the game
+    global_step = 0
+    start_time = time.time()
+    reset_data = envs.reset()
+    if isinstance(reset_data, tuple):
+        next_obs = torch.Tensor(reset_data[0]).to(device)
+        next_info = reset_data[1]
+    else:
+        next_obs = torch.Tensor(reset_data).to(device)
+        next_info = {}
+    next_done = torch.zeros(actual_num_envs).to(device)
+
+    if "global_state" in next_info:
+        # Use the actual shape of the global state provided by your wrappers
+        state_dim = next_info["global_state"].shape[-1] 
+    else:
+        # Fallback for Atari or environments without a God-view state
+        state_dim = num_agents_per_game * np.array(single_observation_space.shape).prod()
+
+    states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
     num_agents = temp_env.num_envs # This is agents per game in SuperSuit
-    agent = Agent(envs, num_agents).to(device)
+    agent = Agent(envs, num_agents, state_dim=state_dim).to(device)
     # agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
@@ -394,19 +435,6 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     dones = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
-
-    state_dim = temp_env.unwrapped.state().shape[0]
-    states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
-
-    # TRY NOT TO MODIFY: start the game
-    global_step = 0
-    start_time = time.time()
-    reset_data = envs.reset()
-    if isinstance(reset_data, tuple):
-        next_obs = torch.Tensor(reset_data[0]).to(device)
-    else:
-        next_obs = torch.Tensor(reset_data).to(device)
-    next_done = torch.zeros(actual_num_envs).to(device)
 
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.
@@ -420,9 +448,9 @@ if __name__ == "__main__":
             # Then hold at 0 for the final 20% to "harden" the policy
             progress = (update - 1.0) / num_updates
             if progress < 0.8:
-                ent_coef_now = max(0.01, args.ent_coef * (1.0 - progress / 0.8))
+                ent_coef_now = max(0.001, args.ent_coef * (1.0 - progress / 0.8))
             else:
-                ent_coef_now = 0.01
+                ent_coef_now = 0.001
         else:
             ent_coef_now = args.ent_coef
 
@@ -430,10 +458,12 @@ if __name__ == "__main__":
             global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
+            current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+            states[step] = current_game_states
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs, denormalize=True)
+                action, logprob, _, value = agent.get_action_and_value(next_obs, centralized_state=states[step], denormalize=True)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -443,37 +473,38 @@ if __name__ == "__main__":
     
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
-                next_obs, reward, terminations, truncations, info = step_data
+                next_obs, reward, terminations, truncations, next_info = step_data
                 done = np.logical_or(terminations, truncations) # Combine for PPO
             else:
-                next_obs, reward, done, info = step_data
+                next_obs, reward, done, next_info = step_data
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             # LOGGING TEAM DATA
-            if "final_info" in info:
+            if "final_info" in next_info:
                 # Standard Gymnasium / SyncVectorEnv format
-                for item in info["final_info"]:
+                for item in next_info["final_info"]:
                     if item is not None and "episode" in item:
                         r = item["episode"]["r"]
                         print(f"global_step={global_step}, episodic_return={r}")
                         writer.add_scalar("charts/team_episodic_return", item["episode"]["r"], global_step)
                         writer.add_scalar("charts/team_episodic_length", item["episode"]["l"], global_step)
                         break 
-            elif "_episode" in info:
+            elif "_episode" in next_info:
                 # gym.wrappers.vector.RecordEpisodeStatistics format
-                for i, done in enumerate(info["_episode"]):
+                for i, done in enumerate(next_info["_episode"]):
                     if done:
-                        r = info["episode"]["r"][i]
+                        r = next_info["episode"]["r"][i]
                         print(f"global_step={global_step}, episodic_return={r}")
                         # Extract the return from the arrays
-                        writer.add_scalar("charts/team_episodic_return", info["episode"]["r"][i], global_step)
-                        writer.add_scalar("charts/team_episodic_length", info["episode"]["l"][i], global_step)
+                        writer.add_scalar("charts/team_episodic_return", next_info["episode"]["r"][i], global_step)
+                        writer.add_scalar("charts/team_episodic_length", next_info["episode"]["l"][i], global_step)
                         break # Break after first item since all agents in one game share the reward
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+            next_value = agent.get_value(next_obs, centralized_state=final_state).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -494,6 +525,7 @@ if __name__ == "__main__":
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
+        b_states = states.reshape((-1, state_dim))
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
@@ -505,6 +537,8 @@ if __name__ == "__main__":
 
         agent.value_normalizer.update(b_returns)
         agent.obs_normalizer.update(b_obs)
+        agent.state_normalizer.update(b_states)
+        
         for epoch in range(args.update_epochs):
             np.random.shuffle(joint_inds)
             for start in range(0, num_joint_steps, args.minibatch_size // agent.num_agents):
@@ -514,10 +548,12 @@ if __name__ == "__main__":
                 
                 # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
+                mb_state_inds = mb_joint_inds
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
-                    b_actions.long()[mb_inds]
+                    b_actions.long()[mb_inds],
+                    centralized_state=b_states[mb_state_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
