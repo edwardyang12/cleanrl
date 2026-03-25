@@ -40,13 +40,13 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=40000000,
+    parser.add_argument("--total-timesteps", type=int, default=80000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=16,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=512,
+    parser.add_argument("--num-steps", type=int, default=2048,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -66,7 +66,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=0.05,
+    parser.add_argument("--ent-coef", type=float, default=0.03,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=1.0,
         help="coefficient of the value function")
@@ -113,24 +113,37 @@ class ObservationNormalizer(nn.Module):
         return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
 
 class ValueNormalizer(nn.Module):
-    def __init__(self, epsilon=1e-5):
+    def __init__(self, num_agents, epsilon=1e-5):
         super().__init__()
-        self.register_buffer("running_mean", torch.zeros(1))
-        self.register_buffer("running_var", torch.ones(1))
+        # Initialize as 1D tensors for broadcasting
+        self.register_buffer("running_mean", torch.zeros(num_agents))
+        self.register_buffer("running_var", torch.ones(num_agents))
         self.epsilon = epsilon
 
     def update(self, x):
-        batch_mean = x.mean()
-        batch_var = x.var()
-        # Simple moving average for normalization
+        num_agents = self.running_mean.shape[0]
+        # Reshape flattened batch to [N, num_agents]
+        x_reshaped = x.view(-1, num_agents)
+        batch_mean = x_reshaped.mean(dim=0)
+        batch_var = x_reshaped.var(dim=0)
+        
         self.running_mean = 0.99 * self.running_mean + 0.01 * batch_mean
         self.running_var = 0.99 * self.running_var + 0.01 * batch_var
 
     def normalize(self, x):
-        return (x - self.running_mean) / torch.sqrt(self.running_var + self.epsilon)
+        num_agents = self.running_mean.shape[0]
+        # Reshape to [N, num_agents] to allow broadcasting across rows
+        original_shape = x.shape
+        x_reshaped = x.view(-1, num_agents)
+        normalized = (x_reshaped - self.running_mean) / torch.sqrt(self.running_var + self.epsilon)
+        return normalized.view(original_shape)
 
     def denormalize(self, x):
-        return x * torch.sqrt(self.running_var + self.epsilon) + self.running_mean
+        num_agents = self.running_mean.shape[0]
+        original_shape = x.shape
+        x_reshaped = x.view(-1, num_agents)
+        denormalized = x_reshaped * torch.sqrt(self.running_var + self.epsilon) + self.running_mean
+        return denormalized.view(original_shape)
 
 # class Agent(nn.Module):
 #     def __init__(self, envs):
@@ -192,7 +205,7 @@ class Agent(nn.Module):
         self.num_agents = num_agents
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
-        self.value_normalizer = ValueNormalizer()
+        self.value_normalizer = ValueNormalizer(num_agents)
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
         self.state_normalizer = ObservationNormalizer(state_dim)
         
@@ -221,10 +234,10 @@ class Agent(nn.Module):
         self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
 
     def get_value(self, x, centralized_state=None, denormalize=False):
-        # NORMALIZE the local obs for actors, but we need the STATE for critic
-        x_norm = self.obs_normalizer.normalize(x)
-        
+                
         if centralized_state is None:
+            # NORMALIZE the local obs for actors, but we need the STATE for critic
+            x_norm = self.obs_normalizer.normalize(x)
             # Fallback for rollout: Reshape local observations into a "proxy" state
             batch_size = x.shape[0]
             num_games = batch_size // self.num_agents
@@ -276,11 +289,11 @@ class StateWrapper(BaseParallelWrapper):
         return obs, infos
 
 # 1. Base Environment Factory
-def make_env(env_id):
+def make_env(env_id, seed):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -294,6 +307,7 @@ def make_env(env_id):
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
         env = ss.pettingzoo_env_to_vec_env_v1(env)
+        env.reset(seed=seed)
         return env
     return thunk
 
@@ -335,7 +349,10 @@ if __name__ == "__main__":
 
     # 3. Create Parallel Games via SuperSuit's Native Concatenator
     num_games = args.num_envs // num_agents_per_game
-    envs = ss.concat_vec_envs_v1(make_env(args.env_id)(), num_games, num_cpus=0, base_class="gymnasium")
+    envs = ss.concat_vec_envs_v1(
+        [make_env(args.env_id, args.seed + i)() for i in range(num_games)], 
+        1, num_cpus=0, base_class="gymnasium"
+    )
 
     # 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
     class DictInfoWrapper(gym.vector.VectorEnv):
@@ -447,7 +464,7 @@ if __name__ == "__main__":
             # Scale from start_ent down to 0 over the first 80% of training
             # Then hold at 0 for the final 20% to "harden" the policy
             progress = (update - 1.0) / num_updates
-            if progress < 0.8:
+            if progress < 0.6:
                 ent_coef_now = max(0.001, args.ent_coef * (1.0 - progress / 0.8))
             else:
                 ent_coef_now = 0.001
@@ -458,7 +475,11 @@ if __name__ == "__main__":
             global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
-            current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+            if "global_state" in next_info:
+                current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+            else:
+                # Fallback for Atari: Reshape current observations as the "God-view"
+                current_game_states = next_obs.view(num_games, -1)
             states[step] = current_game_states
 
             # ALGO LOGIC: action logic
@@ -503,8 +524,13 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-            next_value = agent.get_value(next_obs, centralized_state=final_state).reshape(1, -1)
+            if "global_state" in next_info:
+                # True global state for MPE
+                final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+            else:
+                # Fallback for Atari: Proxy state from observations
+                final_state = next_obs.view(num_games, -1)
+            next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -566,7 +592,9 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
+                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-8)
+                    mb_advantages = mb_adv_reshaped.reshape(-1)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
