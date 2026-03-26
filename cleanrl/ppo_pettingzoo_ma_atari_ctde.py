@@ -9,6 +9,7 @@ from distutils.util import strtobool
 import gymnasium as gym
 import numpy as np
 import supersuit as ss
+from supersuit.vector import ConcatVecEnv
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -208,27 +209,40 @@ class Agent(nn.Module):
         self.value_normalizer = ValueNormalizer(num_agents)
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
         self.state_normalizer = ObservationNormalizer(state_dim)
-        
 
-        # DECENTRALIZED ACTOR: Only sees individual observation
+        # DEEPER DECENTRALIZED ACTOR (4 Layers)
+        # Increased depth helps the agent fine-tune its navigation logic
         self.actor_encoder = nn.Sequential(
             layer_init(nn.Linear(self.obs_dim, 512)),
             nn.LayerNorm(512),
             nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512),
+            nn.ReLU(),
             layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
         self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
 
+        # DEEPER CENTRALIZED CRITIC (4 Layers)
+        # State dimension for 15 agents is large; more layers are needed to process the joint state
         concatenated_obs_dim = self.num_agents * self.obs_dim
         self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
-        # CENTRALIZED CRITIC: Sees observations of ALL agents in the game
-        # Input size = obs_dim * num_agents
+        
         self.critic_encoder = nn.Sequential(
             layer_init(nn.Linear(state_dim, 512)),
             nn.LayerNorm(512),
             nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512),
+            nn.ReLU(),
             layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
         self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
@@ -293,7 +307,7 @@ def make_env(env_id, seed):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, local_ratio=0.2, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -307,7 +321,6 @@ def make_env(env_id, seed):
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
         env = ss.pettingzoo_env_to_vec_env_v1(env)
-        env.reset(seed=seed)
         return env
     return thunk
 
@@ -334,14 +347,15 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
-    np.random.seed(args.seed)
+    # np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
+    rng = np.random.default_rng(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # 2. Extract single-agent metadata
-    temp_env = make_env(args.env_id)()
+    temp_env = make_env(args.env_id, args.seed)()
     num_agents_per_game = temp_env.num_envs 
     single_action_space = temp_env.action_space 
     single_observation_space = temp_env.observation_space
@@ -349,10 +363,12 @@ if __name__ == "__main__":
 
     # 3. Create Parallel Games via SuperSuit's Native Concatenator
     num_games = args.num_envs // num_agents_per_game
-    envs = ss.concat_vec_envs_v1(
-        [make_env(args.env_id, args.seed + i)() for i in range(num_games)], 
-        1, num_cpus=0, base_class="gymnasium"
-    )
+
+    # Create the list of environments first
+    env_list = [make_env(args.env_id, args.seed + i) for i in range(num_games)]
+    
+    # Corrected ConcatVecEnv call (only takes the list)
+    envs = ConcatVecEnv(env_list)
 
     # 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
     class DictInfoWrapper(gym.vector.VectorEnv):
@@ -376,19 +392,42 @@ if __name__ == "__main__":
             return obs, rew, term, trunc, info
             
         def reset(self, seed=None, options=None):
-            obs, info = self.env.reset(seed=seed, options=options)
+            # If a seed is provided, we must manually stagger it for the sub-environments
+            # Because ConcatVecEnv usually passes the same seed to all workers
+            if seed is not None:
+                # We access the internal list of environments in ConcatVecEnv
+                # And call reset on each with a unique staggered seed
+                obs_list = []
+                info_list = []
+                for i, sub_env in enumerate(self.env.vec_envs):
+                    o, f = sub_env.reset(seed=seed + i*1000, options=options)
+                    obs_list.append(o)
+                    info_list.append(f)
+                
+                # Combine observations and infos manually to match VectorEnv format
+                obs = np.concatenate(obs_list)
+                info = [item for sublist in info_list for item in (sublist if isinstance(sublist, list) else [sublist])]
+            else:
+                # If no seed, fall back to default reset
+                obs, info = self.env.reset(options=options)
+                
             if isinstance(info, list):
-                # Promote global_state to top level exactly like in step()
                 global_state_list = [i.get("global_state") for i in info]
                 info = {"global_state": np.array(global_state_list), "agents": info}
             return obs, info
             
         def render(self):
-            frames = self.env.render()
-            # Prevent 1-frame video crash by ensuring frame length matches actual_num_envs
-            if not isinstance(frames, list) or len(frames) != self.num_envs:
-                frames = [frames] * self.num_envs
-            return frames
+            # 1. Bypass the automatic tiling of ConcatVecEnv
+            # Access the internal list of 5 games and render each one individually
+            game_frames = [sub_env.render() for sub_env in self.env.vec_envs]
+            
+            # 2. Map Game-level frames to Agent-level windows
+            # RecordVideo expects a list of length self.num_envs (15 agents)
+            # We determine how many agents are in each game (e.g., 3)
+            num_agents_per_game = self.num_envs // len(self.env.vec_envs)
+            
+            # Create a list of 15 frames: [Game0, Game0, Game0, Game1, Game1, Game1, ...]
+            return [f for f in game_frames for _ in range(num_agents_per_game)]
             
         def close(self): 
             return self.env.close()
@@ -422,7 +461,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    reset_data = envs.reset()
+    reset_data = envs.reset(seed=args.seed)
     if isinstance(reset_data, tuple):
         next_obs = torch.Tensor(reset_data[0]).to(device)
         next_info = reset_data[1]
@@ -433,7 +472,15 @@ if __name__ == "__main__":
 
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
-        state_dim = next_info["global_state"].shape[-1] 
+        state_dim = next_info["global_state"].shape[-1]
+
+        state0 = next_info["global_state"][0]
+        state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
+        if state1 is not None:
+            diff = np.abs(state0 - state1).sum()
+            print(f"DEBUG: Environmental Divergence Score: {diff}")
+            if diff == 0:
+                print("WARNING: Environments are still synchronized!")
     else:
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(single_observation_space.shape).prod()
@@ -464,7 +511,7 @@ if __name__ == "__main__":
             # Scale from start_ent down to 0 over the first 80% of training
             # Then hold at 0 for the final 20% to "harden" the policy
             progress = (update - 1.0) / num_updates
-            if progress < 0.6:
+            if progress < 0.8:
                 ent_coef_now = max(0.001, args.ent_coef * (1.0 - progress / 0.8))
             else:
                 ent_coef_now = 0.001
@@ -566,7 +613,7 @@ if __name__ == "__main__":
         agent.state_normalizer.update(b_states)
         
         for epoch in range(args.update_epochs):
-            np.random.shuffle(joint_inds)
+            rng.shuffle(joint_inds)
             for start in range(0, num_joint_steps, args.minibatch_size // agent.num_agents):
                 end = start + (args.minibatch_size // agent.num_agents)
                 # Pick joint indices and expand them to include all agents in those games
@@ -593,7 +640,7 @@ if __name__ == "__main__":
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
-                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-8)
+                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-5)
                     mb_advantages = mb_adv_reshaped.reshape(-1)
 
                 # Policy loss
