@@ -200,6 +200,84 @@ class ValueNormalizer(nn.Module):
 #             action = probs.sample()
 #         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
+# class Agent(nn.Module):
+#     def __init__(self, envs, num_agents, state_dim):
+#         super().__init__()
+#         self.num_agents = num_agents
+#         obs_shape = envs.single_observation_space.shape
+#         self.obs_dim = np.array(obs_shape).prod()
+#         self.value_normalizer = ValueNormalizer(num_agents)
+#         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+#         self.state_normalizer = ObservationNormalizer(state_dim)
+
+#         # DEEPER DECENTRALIZED ACTOR (4 Layers)
+#         # Increased depth helps the agent fine-tune its navigation logic
+#         self.actor_encoder = nn.Sequential(
+#             layer_init(nn.Linear(self.obs_dim, 512)),
+#             nn.LayerNorm(512),
+#             nn.ReLU(),
+#             layer_init(nn.Linear(512, 512)),
+#             nn.LayerNorm(512),
+#             nn.ReLU(),
+#             layer_init(nn.Linear(512, 256)),
+#             nn.LayerNorm(256),
+#             nn.ReLU(),
+#             layer_init(nn.Linear(256, 256)),
+#             nn.ReLU(),
+#         )
+#         self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+
+#         # DEEPER CENTRALIZED CRITIC (4 Layers)
+#         # State dimension for 15 agents is large; more layers are needed to process the joint state
+#         concatenated_obs_dim = self.num_agents * self.obs_dim
+#         self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
+        
+#         self.critic_encoder = nn.Sequential(
+#             layer_init(nn.Linear(state_dim, 512)),
+#             nn.LayerNorm(512),
+#             nn.ReLU(),
+#             layer_init(nn.Linear(512, 512)),
+#             nn.LayerNorm(512),
+#             nn.ReLU(),
+#             layer_init(nn.Linear(512, 256)),
+#             nn.LayerNorm(256),
+#             nn.ReLU(),
+#             layer_init(nn.Linear(256, 256)),
+#             nn.ReLU(),
+#         )
+#         self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
+
+#     def get_value(self, x, centralized_state=None, denormalize=False):
+                
+#         if centralized_state is None:
+#             # NORMALIZE the local obs for actors, but we need the STATE for critic
+#             x_norm = self.obs_normalizer.normalize(x)
+#             # Fallback for rollout: Reshape local observations into a "proxy" state
+#             batch_size = x.shape[0]
+#             num_games = batch_size // self.num_agents
+#             proxy_state = x_norm.view(num_games, -1)
+#             centralized_state = self.critic_projection(proxy_state)
+#         else:
+#             # Training: Use the True Global State buffer
+#             centralized_state = self.state_normalizer.normalize(centralized_state)
+
+#         all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
+        
+#         if denormalize:
+#             all_agent_values = self.value_normalizer.denormalize(all_agent_values)
+#         return all_agent_values.view(-1, 1)
+
+#     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
+#         x_norm = self.obs_normalizer.normalize(x)
+#         actor_hidden = self.actor_encoder(x_norm)
+#         probs = Categorical(logits=self.actor(actor_hidden))
+        
+#         if action is None:
+#             action = probs.sample()
+            
+#         # Pass the centralized_state down to get_value
+#         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
+
 class Agent(nn.Module):
     def __init__(self, envs, num_agents, state_dim):
         super().__init__()
@@ -210,72 +288,72 @@ class Agent(nn.Module):
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
         self.state_normalizer = ObservationNormalizer(state_dim)
 
-        # DEEPER DECENTRALIZED ACTOR (4 Layers)
-        # Increased depth helps the agent fine-tune its navigation logic
-        self.actor_encoder = nn.Sequential(
-            layer_init(nn.Linear(self.obs_dim, 512)),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            layer_init(nn.Linear(512, 256)),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU(),
-        )
-        self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+        # HETEROGENEOUS ACTORS: Each agent ID gets its own unique brain
+        self.actors = nn.ModuleList([
+            nn.Sequential(
+                layer_init(nn.Linear(self.obs_dim, 512)),
+                nn.LayerNorm(512), nn.ReLU(),
+                layer_init(nn.Linear(512, 512)),
+                nn.LayerNorm(512), nn.ReLU(),
+                layer_init(nn.Linear(512, 256)),
+                nn.LayerNorm(256), nn.ReLU(),
+                layer_init(nn.Linear(256, 256)),
+                nn.ReLU(),
+                layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+            ) for _ in range(num_agents)
+        ])
 
-        # DEEPER CENTRALIZED CRITIC (4 Layers)
-        # State dimension for 15 agents is large; more layers are needed to process the joint state
+        # SHARED CENTRALIZED CRITIC: One brain to judge the whole team
         concatenated_obs_dim = self.num_agents * self.obs_dim
         self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
         
         self.critic_encoder = nn.Sequential(
             layer_init(nn.Linear(state_dim, 512)),
-            nn.LayerNorm(512),
-            nn.ReLU(),
+            nn.LayerNorm(512), nn.ReLU(),
             layer_init(nn.Linear(512, 512)),
-            nn.LayerNorm(512),
-            nn.ReLU(),
+            nn.LayerNorm(512), nn.ReLU(),
             layer_init(nn.Linear(512, 256)),
-            nn.LayerNorm(256),
-            nn.ReLU(),
+            nn.LayerNorm(256), nn.ReLU(),
             layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
         self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
 
     def get_value(self, x, centralized_state=None, denormalize=False):
-                
         if centralized_state is None:
-            # NORMALIZE the local obs for actors, but we need the STATE for critic
             x_norm = self.obs_normalizer.normalize(x)
-            # Fallback for rollout: Reshape local observations into a "proxy" state
             batch_size = x.shape[0]
             num_games = batch_size // self.num_agents
             proxy_state = x_norm.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
-            # Training: Use the True Global State buffer
             centralized_state = self.state_normalizer.normalize(centralized_state)
 
         all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
-        
         if denormalize:
             all_agent_values = self.value_normalizer.denormalize(all_agent_values)
         return all_agent_values.view(-1, 1)
 
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x)
-        actor_hidden = self.actor_encoder(x_norm)
-        probs = Categorical(logits=self.actor(actor_hidden))
+        batch_size = x.shape[0]
+        
+        # Reshape to [NumGames, NumAgents, ObsDim]
+        obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
+        
+        logits_list = []
+        for i in range(self.num_agents):
+            # Each observation in the game is passed to its specific Actor
+            logits = self.actors[i](obs_reshaped[:, i, :])
+            logits_list.append(logits)
+        
+        # Flatten back to [BatchSize, NumActions]
+        combined_logits = torch.stack(logits_list, dim=1).view(batch_size, -1)
+        probs = Categorical(logits=combined_logits)
         
         if action is None:
             action = probs.sample()
             
-        # Pass the centralized_state down to get_value
         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
 
 class StateWrapper(BaseParallelWrapper):
@@ -307,7 +385,7 @@ def make_env(env_id, seed):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, local_ratio=0.2, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -472,7 +550,8 @@ if __name__ == "__main__":
 
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
-        state_dim = next_info["global_state"].shape[-1]
+        # state_dim = next_info["global_state"].shape[-1]
+        state_dim = num_agents_per_game * np.array(single_observation_space.shape).prod()
 
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
@@ -608,9 +687,11 @@ if __name__ == "__main__":
         num_joint_steps = args.batch_size // agent.num_agents
         joint_inds = np.arange(num_joint_steps)
 
+        b_concatenated_obs = b_obs.view(num_joint_steps, agent.num_agents * agent.obs_dim)
+        
         agent.value_normalizer.update(b_returns)
         agent.obs_normalizer.update(b_obs)
-        agent.state_normalizer.update(b_states)
+        agent.state_normalizer.update(b_concatenated_obs)
         
         for epoch in range(args.update_epochs):
             rng.shuffle(joint_inds)
@@ -622,11 +703,12 @@ if __name__ == "__main__":
                 # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
                 mb_state_inds = mb_joint_inds
+                mb_states_for_critic = b_concatenated_obs[mb_state_inds]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
                     b_actions.long()[mb_inds],
-                    centralized_state=b_states[mb_state_inds]
+                    centralized_state=mb_states_for_critic
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -640,7 +722,7 @@ if __name__ == "__main__":
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
-                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-5)
+                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
                     mb_advantages = mb_adv_reshaped.reshape(-1)
 
                 # Policy loss
@@ -652,22 +734,33 @@ if __name__ == "__main__":
                 newvalue = newvalue.view(-1)
                 normalized_returns = agent.value_normalizer.normalize(b_returns[mb_inds])
                 normalized_values = agent.value_normalizer.normalize(b_values[mb_inds])
+
+                # Standard individual value loss
+                v_loss_unclipped = (newvalue - normalized_returns) ** 2
+                
+                # NEW: Value Decomposition Loss
+                # Reshape to [Minibatch_Games, num_agents]
+                nv_reshaped = newvalue.view(-1, agent.num_agents)
+                nr_reshaped = normalized_returns.view(-1, agent.num_agents)
+                
+                # Penalize the difference between Sum(Predicted Values) and Sum(Actual Returns)
+                joint_v_loss = 0.5 * ((nv_reshaped.sum(dim=1) - nr_reshaped.sum(dim=1)) ** 2).mean()
+
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - normalized_returns) ** 2
                     v_clipped = normalized_values + torch.clamp(
-                        newvalue - normalized_values,
-                        -args.clip_coef,
-                        args.clip_coef,
+                        newvalue - normalized_values, -args.clip_coef, args.clip_coef,
                     )
                     v_loss_clipped = (v_clipped - normalized_returns) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    
-                    v_loss = 0.5 * ((newvalue - normalized_returns) ** 2).mean()
+                    v_loss = 0.5 * v_loss_unclipped.mean()
 
+                # Combine with a weight for the joint loss
+                total_v_loss = v_loss + 0.1 * joint_v_loss 
+                
                 entropy_loss = entropy.mean()
-                loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - ent_coef_now * entropy_loss + total_v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
