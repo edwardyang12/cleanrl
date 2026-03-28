@@ -385,7 +385,7 @@ def make_env(env_id, seed):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=3, max_cycles=50, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=3, max_cycles=80, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -569,7 +569,11 @@ if __name__ == "__main__":
     num_agents = temp_env.num_envs # This is agents per game in SuperSuit
     agent = Agent(envs, num_agents, state_dim=state_dim).to(device)
     # agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = optim.Adam([
+            {'params': list(agent.actors.parameters()), 'lr': 3e-4}, 
+            {'params': list(agent.critic_encoder.parameters()) + list(agent.critic.parameters()), 'lr': 1e-3} 
+        ], eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)
@@ -583,17 +587,24 @@ if __name__ == "__main__":
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
-            lrnow = max(5e-5, frac * args.learning_rate)
-            optimizer.param_groups[0]["lr"] = lrnow
-
+            for i, param_group in enumerate(optimizer.param_groups):
+                # We fetch the initial_lr we set in the Adam constructor
+                # If we didn't store it, we can use the current group's base
+                if i == 0:
+                    initial_lr = 3e-4 
+                    param_group["lr"] = max(5e-5, frac * initial_lr)
+                else:
+                    initial_lr = 1e-3
+                    param_group["lr"] = max(1e-4, frac * initial_lr)
+                
         if args.anneal_ent:
             # Scale from start_ent down to 0 over the first 80% of training
             # Then hold at 0 for the final 20% to "harden" the policy
             progress = (update - 1.0) / num_updates
-            if progress < 0.8:
-                ent_coef_now = max(0.001, args.ent_coef * (1.0 - progress / 0.8))
+            if progress < 0.7:
+                ent_coef_now = max(0.0001, args.ent_coef * (1.0 - progress / 0.8))
             else:
-                ent_coef_now = 0.001
+                ent_coef_now = 0.0001
         else:
             ent_coef_now = args.ent_coef
 
@@ -602,7 +613,8 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
             if "global_state" in next_info:
-                current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+                # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+                current_game_states = next_obs.view(num_games, -1)
             else:
                 # Fallback for Atari: Reshape current observations as the "God-view"
                 current_game_states = next_obs.view(num_games, -1)
@@ -652,7 +664,8 @@ if __name__ == "__main__":
         with torch.no_grad():
             if "global_state" in next_info:
                 # True global state for MPE
-                final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+                # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+                final_state = next_obs.view(num_games, -1)
             else:
                 # Fallback for Atari: Proxy state from observations
                 final_state = next_obs.view(num_games, -1)
