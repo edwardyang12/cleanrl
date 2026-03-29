@@ -45,7 +45,7 @@ def parse_args():
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=16,
+    parser.add_argument("--num-envs", type=int, default=32,
         help="the number of parallel game environments")
     parser.add_argument("--num-steps", type=int, default=2048,
         help="the number of steps to run in each environment per policy rollout")
@@ -57,7 +57,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=16,
+    parser.add_argument("--num-minibatches", type=int, default=8,
         help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=10,
         help="the K epochs to update the policy")
@@ -69,12 +69,14 @@ def parse_args():
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
     parser.add_argument("--ent-coef", type=float, default=0.03,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=1.0,
+    parser.add_argument("--vf-coef", type=float, default=0.75,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--num-landmarks", type=int, default=3,
+        help="number of agents and landmarks")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -96,7 +98,7 @@ class ObservationNormalizer(nn.Module):
 
     def update(self, x):
         batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
         batch_count = x.shape[0]
 
         # Update running mean and variance using Welford's algorithm
@@ -145,6 +147,58 @@ class ValueNormalizer(nn.Module):
         x_reshaped = x.view(-1, num_agents)
         denormalized = x_reshaped * torch.sqrt(self.running_var + self.epsilon) + self.running_mean
         return denormalized.view(original_shape)
+
+class PopArt(nn.Module):
+    def __init__(self, input_dim, output_dim, beta=0.99):
+        super().__init__()
+        self.beta = beta
+        self.register_buffer("mean", torch.zeros(output_dim))
+        self.register_buffer("mean_sq", torch.zeros(output_dim))
+        self.register_buffer("std", torch.ones(output_dim))
+        self.v_head = layer_init(nn.Linear(input_dim, output_dim), std=1)
+
+    def forward(self, x):
+        return self.v_head(x)
+
+    def update(self, targets):
+        # Update statistics and correct weights to preserve unnormalized outputs
+        with torch.no_grad():
+            batch_mean = targets.mean(dim=0)
+            batch_mean_sq = (targets**2).mean(dim=0)
+            new_mean = self.beta * self.mean + (1 - self.beta) * batch_mean
+            new_mean_sq = self.beta * self.mean_sq + (1 - self.beta) * batch_mean_sq
+            new_std = torch.sqrt(torch.clamp(new_mean_sq - new_mean**2, min=1e-5))
+
+            # FIX: Reshape the scale factor to (output_dim, 1) for broadcasting
+            scale_factor = (self.std / new_std).view(-1, 1)
+            self.v_head.weight.data.mul_(scale_factor)
+            
+            # Bias is (3,), so this line remains the same
+            self.v_head.bias.data.mul_(self.std).add_(self.mean - new_mean).div_(new_std)
+            
+            self.mean.copy_(new_mean)
+            self.mean_sq.copy_(new_mean_sq)
+            self.std.copy_(new_std)
+
+    def denormalize(self, x):
+        return x * self.std + self.mean
+    
+    def normalize(self, x):
+        return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
+
+class RewardNormalizer:
+    def __init__(self, num_envs, gamma=0.99):
+        self.returns = np.zeros(num_envs)
+        self.gamma = gamma
+        self.running_std = 1.0
+
+    def __call__(self, rewards, dones):
+        # Track discounted returns to estimate reward scale
+        self.returns = self.returns * self.gamma + rewards
+        self.running_std = 0.99 * self.running_std + 0.01 * np.std(self.returns)
+        # Reset returns for finished episodes
+        self.returns[dones > 0] = 0
+        return rewards / (self.running_std + 1e-8)
 
 # class Agent(nn.Module):
 #     def __init__(self, envs):
@@ -284,9 +338,12 @@ class Agent(nn.Module):
         self.num_agents = num_agents
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
-        self.value_normalizer = ValueNormalizer(num_agents)
+        # self.value_normalizer = ValueNormalizer(num_agents)
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
-        self.state_normalizer = ObservationNormalizer(state_dim)
+
+        self.continuous_state_dim = state_dim - self.num_agents
+        self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
+        # self.state_normalizer = ObservationNormalizer(state_dim)
 
         # HETEROGENEOUS ACTORS: Each agent ID gets its own unique brain
         self.actors = nn.ModuleList([
@@ -317,7 +374,7 @@ class Agent(nn.Module):
             layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
-        self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
+        self.critic = PopArt(256, self.num_agents)
 
     def get_value(self, x, centralized_state=None, denormalize=False):
         if centralized_state is None:
@@ -327,11 +384,17 @@ class Agent(nn.Module):
             proxy_state = x_norm.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
-            centralized_state = self.state_normalizer.normalize(centralized_state)
-
+            continuous_part = centralized_state[..., :-self.num_agents]
+            binary_part = centralized_state[..., -self.num_agents:]
+            
+            # 2. Normalize only the continuous data
+            norm_continuous = self.state_normalizer.normalize(continuous_part)
+            
+            # 3. Stitch them back together for the Critic network
+            centralized_state = torch.cat([norm_continuous, binary_part], dim=-1)
         all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
         if denormalize:
-            all_agent_values = self.value_normalizer.denormalize(all_agent_values)
+            all_agent_values = self.critic.denormalize(all_agent_values)
         return all_agent_values.view(-1, 1)
 
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
@@ -385,7 +448,7 @@ def make_env(env_id, seed):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=3, max_cycles=80, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=args.num_landmarks, max_cycles=100, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -518,6 +581,8 @@ if __name__ == "__main__":
     envs.single_observation_space = single_observation_space
     actual_num_envs = envs.num_envs
 
+    # reward_norm = RewardNormalizer(actual_num_envs, args.gamma)
+
     # 5. Apply Wrappers (Now safely receiving the expected Dict format and Vector type)
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     if args.capture_video:
@@ -551,7 +616,7 @@ if __name__ == "__main__":
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
         # state_dim = next_info["global_state"].shape[-1]
-        state_dim = num_agents_per_game * np.array(single_observation_space.shape).prod()
+        state_dim = (num_agents_per_game * np.array(single_observation_space.shape).prod()) + args.num_landmarks
 
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
@@ -572,7 +637,9 @@ if __name__ == "__main__":
     # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     optimizer = optim.Adam([
             {'params': list(agent.actors.parameters()), 'lr': 3e-4}, 
-            {'params': list(agent.critic_encoder.parameters()) + list(agent.critic.parameters()), 'lr': 1e-3} 
+            {'params': list(agent.critic_encoder.parameters()) + 
+                    list(agent.critic.parameters()) + 
+                    list(agent.critic_projection.parameters()), 'lr': 1e-3} 
         ], eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -601,10 +668,10 @@ if __name__ == "__main__":
             # Scale from start_ent down to 0 over the first 80% of training
             # Then hold at 0 for the final 20% to "harden" the policy
             progress = (update - 1.0) / num_updates
-            if progress < 0.7:
-                ent_coef_now = max(0.001, args.ent_coef * (1.0 - progress / 0.8))
+            if progress < 0.85:
+                ent_coef_now = max(0.0001, args.ent_coef * (1.0 - progress / 0.8))
             else:
-                ent_coef_now = 0.001
+                ent_coef_now = 0.0001
         else:
             ent_coef_now = args.ent_coef
 
@@ -618,7 +685,12 @@ if __name__ == "__main__":
             else:
                 # Fallback for Atari: Reshape current observations as the "God-view"
                 current_game_states = next_obs.view(num_games, -1)
-            states[step] = current_game_states
+
+            landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+            landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+            occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
+            states[step] = torch.cat([current_game_states, occupied], dim=-1)
+            #states[step] = current_game_states
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -636,6 +708,8 @@ if __name__ == "__main__":
                 done = np.logical_or(terminations, truncations) # Combine for PPO
             else:
                 next_obs, reward, done, next_info = step_data
+
+            # normalized_step_rewards = reward_norm(reward, done)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
@@ -669,8 +743,16 @@ if __name__ == "__main__":
             else:
                 # Fallback for Atari: Proxy state from observations
                 final_state = next_obs.view(num_games, -1)
+
+            landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+            landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+            occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
+            final_state = torch.cat([final_state, occupied], dim=-1)
+
             next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
+    
+            # Standard GAE to get returns
+            temp_advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
@@ -680,8 +762,46 @@ if __name__ == "__main__":
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                temp_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            
+            # This is our optimization target
+            b_returns = (temp_advantages + values).reshape(-1)
+            b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+            b_states = states.reshape((-1, state_dim))
+
+            # 2. UPDATE STATS NOW (Before SGD)1
+            # This aligns the normalizers with the data we just collected
+            agent.critic.update(b_returns.view(-1, agent.num_agents))
+            agent.obs_normalizer.update(b_obs)
+
+            continuous_b_states = b_states[:, :-args.num_landmarks]
+            agent.state_normalizer.update(continuous_b_states)
+
+            # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
+            # This is the crucial step you were missing. 
+            # It ensures 'values' and 'returns' are in the same normalized space for SGD.
+            new_values = torch.zeros_like(values)
+            for t in range(args.num_steps):
+                # get_value now uses the updated normalization buffers
+                new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
+            
+            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
+            
+            # Final GAE calculation for the actual SGD update
+            advantages = torch.zeros_like(rewards).to(device)
+            lastgaelam = 0
+            for t in reversed(range(args.num_steps)):
+                if t == args.num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = new_next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextvalues = new_values[t + 1]
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - new_values[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            returns = advantages + values
+            
+            returns = advantages + new_values
+            values = new_values # Use the re-calculated values for the SGD 'b_values'
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -700,12 +820,6 @@ if __name__ == "__main__":
         num_joint_steps = args.batch_size // agent.num_agents
         joint_inds = np.arange(num_joint_steps)
 
-        b_concatenated_obs = b_obs.view(num_joint_steps, agent.num_agents * agent.obs_dim)
-        
-        agent.value_normalizer.update(b_returns)
-        agent.obs_normalizer.update(b_obs)
-        agent.state_normalizer.update(b_concatenated_obs)
-        
         for epoch in range(args.update_epochs):
             rng.shuffle(joint_inds)
             for start in range(0, num_joint_steps, args.minibatch_size // agent.num_agents):
@@ -716,7 +830,7 @@ if __name__ == "__main__":
                 # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
                 mb_state_inds = mb_joint_inds
-                mb_states_for_critic = b_concatenated_obs[mb_state_inds]
+                mb_states_for_critic = b_states[mb_state_inds]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
@@ -745,19 +859,25 @@ if __name__ == "__main__":
 
                 # Value loss
                 newvalue = newvalue.view(-1)
-                normalized_returns = agent.value_normalizer.normalize(b_returns[mb_inds])
-                normalized_values = agent.value_normalizer.normalize(b_values[mb_inds])
+
+                # Reshape to align with PopArt agent-specific stats
+                mb_returns_reshaped = b_returns[mb_inds].view(-1, agent.num_agents)
+                mb_values_reshaped = b_values[mb_inds].view(-1, agent.num_agents)
+                
+                # Normalize targets correctly using the per-agent ID statistics
+                normalized_returns = agent.critic.normalize(mb_returns_reshaped).reshape(-1)
+                normalized_values = agent.critic.normalize(mb_values_reshaped).reshape(-1)
 
                 # Standard individual value loss
                 v_loss_unclipped = (newvalue - normalized_returns) ** 2
                 
                 # NEW: Value Decomposition Loss
                 # Reshape to [Minibatch_Games, num_agents]
-                nv_reshaped = newvalue.view(-1, agent.num_agents)
-                nr_reshaped = normalized_returns.view(-1, agent.num_agents)
+                # nv_reshaped = newvalue.view(-1, agent.num_agents)
+                # nr_reshaped = normalized_returns.view(-1, agent.num_agents)
                 
                 # Penalize the difference between Sum(Predicted Values) and Sum(Actual Returns)
-                joint_v_loss = 0.5 * ((nv_reshaped.sum(dim=1) - nr_reshaped.sum(dim=1)) ** 2).mean()
+                # joint_v_loss = 0.5 * ((nv_reshaped.sum(dim=1) - nr_reshaped.sum(dim=1)) ** 2).mean()
 
                 if args.clip_vloss:
                     v_clipped = normalized_values + torch.clamp(
@@ -770,10 +890,11 @@ if __name__ == "__main__":
                     v_loss = 0.5 * v_loss_unclipped.mean()
 
                 # Combine with a weight for the joint loss
-                total_v_loss = v_loss + 0.1 * joint_v_loss 
+                # total_v_loss = v_loss + 0.01 * joint_v_loss 
                 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - ent_coef_now * entropy_loss + total_v_loss * args.vf_coef
+                # loss = pg_loss - ent_coef_now * entropy_loss + total_v_loss * args.vf_coef
+                loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
