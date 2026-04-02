@@ -5,9 +5,11 @@ import os
 import random
 import time
 from distutils.util import strtobool
+import gc
 
 import gymnasium as gym
 import numpy as np
+import cv2
 import supersuit as ss
 from supersuit.vector import ConcatVecEnv
 import torch
@@ -41,13 +43,13 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=80000000,
+    parser.add_argument("--total-timesteps", type=int, default=150000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=32,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=2048,
+    parser.add_argument("--num-steps", type=int, default=4096,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -75,8 +77,10 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--num-landmarks", type=int, default=3,
+    parser.add_argument("--num-landmarks", type=int, default=4,
         help="number of agents and landmarks")
+    parser.add_argument("--max-cycles", type=int, default=150,
+        help="length of environment run")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -200,138 +204,6 @@ class RewardNormalizer:
         self.returns[dones > 0] = 0
         return rewards / (self.running_std + 1e-8)
 
-# class Agent(nn.Module):
-#     def __init__(self, envs):
-#         super().__init__()
-#         obs_shape = envs.single_observation_space.shape
-        
-#         # Check if input is an image (3D) or vector (1D)
-#         if len(obs_shape) == 3: # Atari / Surround
-#             self.is_image = True
-#             self.network = nn.Sequential(
-#                 layer_init(nn.Conv2d(obs_shape[2], 32, 8, stride=4)), # Adjusting for frame stack
-#                 nn.ReLU(),
-#                 layer_init(nn.Conv2d(32, 64, 4, stride=2)),
-#                 nn.ReLU(),
-#                 layer_init(nn.Conv2d(64, 64, 3, stride=1)),
-#                 nn.ReLU(),
-#                 nn.Flatten(),
-#                 layer_init(nn.Linear(64 * 7 * 7, 512)),
-#                 nn.ReLU(),
-#             )
-#             self.is_image = True
-#         else: # MPE / Simple Spread
-#             self.is_image = False
-#             self.network = nn.Sequential(
-#                 layer_init(nn.Linear(np.array(obs_shape).prod(), 512)),
-#                 nn.LayerNorm(512), # Stabilizes coordinate inputs
-#                 nn.ReLU(),
-#                 layer_init(nn.Linear(512, 512)),
-#                 nn.LayerNorm(512),
-#                 nn.ReLU(),
-#                 layer_init(nn.Linear(512, 256)), # Extra layer for coordination complexity
-#                 nn.ReLU(),
-#             )
-            
-#         self.actor = layer_init(nn.Linear(256 if not self.is_image else 512, 
-#                                           envs.single_action_space.n), std=0.01)
-#         self.critic = layer_init(nn.Linear(256 if not self.is_image else 512, 1), std=1)
-
-#     def get_value(self, x):
-#         if self.is_image:
-#             x = x.clone() / 255.0
-#             x = x.permute((0, 3, 1, 2))
-#         return self.critic(self.network(x))
-
-#     def get_action_and_value(self, x, action=None):
-#         if self.is_image:
-#             x = x.clone() / 255.0
-#             x = x.permute((0, 3, 1, 2))
-#         hidden = self.network(x)
-#         logits = self.actor(hidden)
-#         probs = Categorical(logits=logits)
-#         if action is None:
-#             action = probs.sample()
-#         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
-
-# class Agent(nn.Module):
-#     def __init__(self, envs, num_agents, state_dim):
-#         super().__init__()
-#         self.num_agents = num_agents
-#         obs_shape = envs.single_observation_space.shape
-#         self.obs_dim = np.array(obs_shape).prod()
-#         self.value_normalizer = ValueNormalizer(num_agents)
-#         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
-#         self.state_normalizer = ObservationNormalizer(state_dim)
-
-#         # DEEPER DECENTRALIZED ACTOR (4 Layers)
-#         # Increased depth helps the agent fine-tune its navigation logic
-#         self.actor_encoder = nn.Sequential(
-#             layer_init(nn.Linear(self.obs_dim, 512)),
-#             nn.LayerNorm(512),
-#             nn.ReLU(),
-#             layer_init(nn.Linear(512, 512)),
-#             nn.LayerNorm(512),
-#             nn.ReLU(),
-#             layer_init(nn.Linear(512, 256)),
-#             nn.LayerNorm(256),
-#             nn.ReLU(),
-#             layer_init(nn.Linear(256, 256)),
-#             nn.ReLU(),
-#         )
-#         self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
-
-#         # DEEPER CENTRALIZED CRITIC (4 Layers)
-#         # State dimension for 15 agents is large; more layers are needed to process the joint state
-#         concatenated_obs_dim = self.num_agents * self.obs_dim
-#         self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
-        
-#         self.critic_encoder = nn.Sequential(
-#             layer_init(nn.Linear(state_dim, 512)),
-#             nn.LayerNorm(512),
-#             nn.ReLU(),
-#             layer_init(nn.Linear(512, 512)),
-#             nn.LayerNorm(512),
-#             nn.ReLU(),
-#             layer_init(nn.Linear(512, 256)),
-#             nn.LayerNorm(256),
-#             nn.ReLU(),
-#             layer_init(nn.Linear(256, 256)),
-#             nn.ReLU(),
-#         )
-#         self.critic = layer_init(nn.Linear(256, self.num_agents), std=1)
-
-#     def get_value(self, x, centralized_state=None, denormalize=False):
-                
-#         if centralized_state is None:
-#             # NORMALIZE the local obs for actors, but we need the STATE for critic
-#             x_norm = self.obs_normalizer.normalize(x)
-#             # Fallback for rollout: Reshape local observations into a "proxy" state
-#             batch_size = x.shape[0]
-#             num_games = batch_size // self.num_agents
-#             proxy_state = x_norm.view(num_games, -1)
-#             centralized_state = self.critic_projection(proxy_state)
-#         else:
-#             # Training: Use the True Global State buffer
-#             centralized_state = self.state_normalizer.normalize(centralized_state)
-
-#         all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
-        
-#         if denormalize:
-#             all_agent_values = self.value_normalizer.denormalize(all_agent_values)
-#         return all_agent_values.view(-1, 1)
-
-#     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
-#         x_norm = self.obs_normalizer.normalize(x)
-#         actor_hidden = self.actor_encoder(x_norm)
-#         probs = Categorical(logits=self.actor(actor_hidden))
-        
-#         if action is None:
-#             action = probs.sample()
-            
-#         # Pass the centralized_state down to get_value
-#         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
-
 class Agent(nn.Module):
     def __init__(self, envs, num_agents, state_dim):
         super().__init__()
@@ -448,7 +320,8 @@ def make_env(env_id, seed):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=args.num_landmarks, max_cycles=100, local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
+            env = simple_spread_v3.parallel_env(N=args.num_landmarks, max_cycles=args.max_cycles, 
+                                                local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -464,6 +337,137 @@ def make_env(env_id, seed):
         env = ss.pettingzoo_env_to_vec_env_v1(env)
         return env
     return thunk
+
+# 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
+class DictInfoWrapper(gym.vector.VectorEnv):
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = env.num_envs
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.render_mode = "rgb_array"
+        self.metadata = {"render_modes": ["rgb_array"], "render_fps": 5}
+        self._is_vector_env = True
+        self.target_video_size = None
+
+    def step(self, action):
+        obs, rew, term, trunc, info = self.env.step(action)
+        # SuperSuit's concat_vec_envs returns a list of agent info dicts
+        if isinstance(info, list):
+            # Flatten the info for Gymnasium wrappers while preserving our custom key
+            # Extract global_state from the first agent's info to the top level
+            global_state_list = [i.get("global_state") for i in info]
+            info = {"global_state": np.array(global_state_list), "agents": info}
+        return obs, rew, term, trunc, info
+        
+    def reset(self, seed=None, options=None):
+        # If a seed is provided, we must manually stagger it for the sub-environments
+        # Because ConcatVecEnv usually passes the same seed to all workers
+        if seed is not None:
+            # We access the internal list of environments in ConcatVecEnv
+            # And call reset on each with a unique staggered seed
+            obs_list = []
+            info_list = []
+            for i, sub_env in enumerate(self.env.vec_envs):
+                o, f = sub_env.reset(seed=seed + i*1000, options=options)
+                obs_list.append(o)
+                info_list.append(f)
+            
+            # Combine observations and infos manually to match VectorEnv format
+            obs = np.concatenate(obs_list)
+            info = [item for sublist in info_list for item in (sublist if isinstance(sublist, list) else [sublist])]
+        else:
+            # If no seed, fall back to default reset
+            obs, info = self.env.reset(options=options)
+            
+        if isinstance(info, list):
+            global_state_list = [i.get("global_state") for i in info]
+            info = {"global_state": np.array(global_state_list), "agents": info}
+        return obs, info
+        
+    def render(self):
+        # 1. Safely attempt to get raw frames
+        try:
+            game_frames = [sub_env.render() for sub_env in self.env.vec_envs]
+        except Exception:
+            game_frames = [None for _ in self.env.vec_envs]
+        
+        processed_frames = []
+        for f in game_frames:
+            valid_frame = False
+            
+            # FIX: Hardcode a safe maximum resolution. 
+            # 256x256 in a 6x6 grid = 1536x1536 video (Well below the 4096px H.264 limit)
+            if self.target_video_size is None:
+                self.target_video_size = (256, 256)
+
+            if f is not None:
+                try:
+                    img = np.array(f, dtype=np.uint8, copy=True)
+                    
+                    # Handle dimensionality safely
+                    if len(img.shape) >= 2:
+                        if len(img.shape) == 2:
+                            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                        elif len(img.shape) >= 3:
+                            img = img[:, :, :3]
+                            if img.shape[2] == 1:
+                                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                            elif img.shape[2] == 2:
+                                pad = np.zeros((img.shape[0], img.shape[1], 1), dtype=np.uint8)
+                                img = np.concatenate([img, pad], axis=-1)
+                        
+                        # Guaranteed resize down to safe resolution
+                        if (img.shape[1], img.shape[0]) != self.target_video_size:
+                            img = cv2.resize(img, self.target_video_size, interpolation=cv2.INTER_LINEAR)
+                        
+                        # Force contiguous memory and explicitly check the byte count
+                        img = np.ascontiguousarray(img[:, :, :3], dtype=np.uint8)
+                        expected_bytes = self.target_video_size[0] * self.target_video_size[1] * 3
+                        
+                        if len(img.tobytes()) == expected_bytes:
+                            processed_frames.append(img)
+                            valid_frame = True
+                except Exception:
+                    pass 
+            
+            # Impervious Fallback
+            if not valid_frame:
+                blank = np.zeros((self.target_video_size[1], self.target_video_size[0], 3), dtype=np.uint8)
+                processed_frames.append(blank)
+                
+        num_agents_per_game = self.num_envs // len(self.env.vec_envs)
+        return [f for f in processed_frames for _ in range(num_agents_per_game)]
+        
+    def close(self): 
+        return self.env.close()
+
+def build_environments(args, run_name, base_seed):
+    temp_env = make_env(args.env_id, base_seed)()
+    num_agents_per_game = temp_env.num_envs
+    num_games = args.num_envs // num_agents_per_game
+
+    env_list = [make_env(args.env_id, base_seed + i) for i in range(num_games)]
+    envs = ConcatVecEnv(env_list)
+    envs = DictInfoWrapper(envs)
+
+    envs.is_vector_env = True
+    
+    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
+    if args.capture_video:
+        envs = gym.wrappers.vector.RecordVideo(
+            envs, 
+            f"videos/{run_name}", 
+            episode_trigger=lambda x: x % 2000 == 0
+        )
+
+    # Set Final CleanRL attributes
+    envs.single_action_space = temp_env.action_space
+    envs.single_observation_space = temp_env.observation_space
+    temp_env.close()
+    
+    envs.is_vector_env = True
+    return envs, num_agents_per_game, num_games
 
 if __name__ == "__main__":
     args = parse_args()
@@ -495,108 +499,11 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # 2. Extract single-agent metadata
-    temp_env = make_env(args.env_id, args.seed)()
-    num_agents_per_game = temp_env.num_envs 
-    single_action_space = temp_env.action_space 
-    single_observation_space = temp_env.observation_space
-    temp_env.close()
-
-    # 3. Create Parallel Games via SuperSuit's Native Concatenator
-    num_games = args.num_envs // num_agents_per_game
-
-    # Create the list of environments first
-    env_list = [make_env(args.env_id, args.seed + i) for i in range(num_games)]
-    
-    # Corrected ConcatVecEnv call (only takes the list)
-    envs = ConcatVecEnv(env_list)
-
-    # 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
-    class DictInfoWrapper(gym.vector.VectorEnv):
-        def __init__(self, env):
-            self.env = env
-            self.num_envs = env.num_envs
-            self.observation_space = env.observation_space
-            self.action_space = env.action_space
-            self.render_mode = "rgb_array"
-            self.metadata = {"render_modes": ["rgb_array"], "render_fps": 5}
-            self._is_vector_env = True
-
-        def step(self, action):
-            obs, rew, term, trunc, info = self.env.step(action)
-            # SuperSuit's concat_vec_envs returns a list of agent info dicts
-            if isinstance(info, list):
-                # Flatten the info for Gymnasium wrappers while preserving our custom key
-                # Extract global_state from the first agent's info to the top level
-                global_state_list = [i.get("global_state") for i in info]
-                info = {"global_state": np.array(global_state_list), "agents": info}
-            return obs, rew, term, trunc, info
-            
-        def reset(self, seed=None, options=None):
-            # If a seed is provided, we must manually stagger it for the sub-environments
-            # Because ConcatVecEnv usually passes the same seed to all workers
-            if seed is not None:
-                # We access the internal list of environments in ConcatVecEnv
-                # And call reset on each with a unique staggered seed
-                obs_list = []
-                info_list = []
-                for i, sub_env in enumerate(self.env.vec_envs):
-                    o, f = sub_env.reset(seed=seed + i*1000, options=options)
-                    obs_list.append(o)
-                    info_list.append(f)
-                
-                # Combine observations and infos manually to match VectorEnv format
-                obs = np.concatenate(obs_list)
-                info = [item for sublist in info_list for item in (sublist if isinstance(sublist, list) else [sublist])]
-            else:
-                # If no seed, fall back to default reset
-                obs, info = self.env.reset(options=options)
-                
-            if isinstance(info, list):
-                global_state_list = [i.get("global_state") for i in info]
-                info = {"global_state": np.array(global_state_list), "agents": info}
-            return obs, info
-            
-        def render(self):
-            # 1. Bypass the automatic tiling of ConcatVecEnv
-            # Access the internal list of 5 games and render each one individually
-            game_frames = [sub_env.render() for sub_env in self.env.vec_envs]
-            
-            # 2. Map Game-level frames to Agent-level windows
-            # RecordVideo expects a list of length self.num_envs (15 agents)
-            # We determine how many agents are in each game (e.g., 3)
-            num_agents_per_game = self.num_envs // len(self.env.vec_envs)
-            
-            # Create a list of 15 frames: [Game0, Game0, Game0, Game1, Game1, Game1, ...]
-            return [f for f in game_frames for _ in range(num_agents_per_game)]
-            
-        def close(self): 
-            return self.env.close()
-
-    envs = DictInfoWrapper(envs)
-
-    # Patch final cleanRL attributes
-    envs.is_vector_env = True
-    envs.single_action_space = single_action_space
-    envs.single_observation_space = single_observation_space
+    envs, num_agents_per_game, num_games = build_environments(args, run_name, args.seed)
     actual_num_envs = envs.num_envs
 
     # reward_norm = RewardNormalizer(actual_num_envs, args.gamma)
 
-    # 5. Apply Wrappers (Now safely receiving the expected Dict format and Vector type)
-    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
-    if args.capture_video:
-        envs = gym.wrappers.vector.RecordVideo(
-            envs, 
-            f"videos/{run_name}", 
-            episode_trigger=lambda x: x % 2000 == 0
-        )
-
-    # 6. Set Final CleanRL attributes
-    envs.single_action_space = single_action_space
-    envs.single_observation_space = single_observation_space
-    envs.is_vector_env = True
-    
     args.batch_size = int(actual_num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     num_updates = args.total_timesteps // args.batch_size    
@@ -616,7 +523,7 @@ if __name__ == "__main__":
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
         # state_dim = next_info["global_state"].shape[-1]
-        state_dim = (num_agents_per_game * np.array(single_observation_space.shape).prod()) + args.num_landmarks
+        state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
 
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
@@ -627,12 +534,11 @@ if __name__ == "__main__":
                 print("WARNING: Environments are still synchronized!")
     else:
         # Fallback for Atari or environments without a God-view state
-        state_dim = num_agents_per_game * np.array(single_observation_space.shape).prod()
+        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
     states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
-    num_agents = temp_env.num_envs # This is agents per game in SuperSuit
-    agent = Agent(envs, num_agents, state_dim=state_dim).to(device)
+    agent = Agent(envs, num_agents_per_game, state_dim=state_dim).to(device)
     # agent = Agent(envs).to(device)
     # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     optimizer = optim.Adam([
@@ -675,6 +581,29 @@ if __name__ == "__main__":
         else:
             ent_coef_now = args.ent_coef
 
+        if update % 1500 == 0:
+            print(f"--- UPDATE {update}: PERFORMING PHOENIX REBOOT OF ENVIRONMENTS ---")
+            envs.close()
+            
+            # Rebuild with a staggered seed so we don't repeat the exact same scenarios
+            new_seed = args.seed + update 
+            envs, _, _ = build_environments(args, run_name, new_seed)
+            
+            # Re-initialize the starting observations for PPO
+            reset_data = envs.reset(seed=new_seed)
+            if isinstance(reset_data, tuple):
+                next_obs = torch.Tensor(reset_data[0]).to(device)
+                next_info = reset_data[1]
+            else:
+                next_obs = torch.Tensor(reset_data).to(device)
+                next_info = {}
+            next_done = torch.zeros(actual_num_envs).to(device)
+            
+            # Re-sync the global state tracking
+            if "global_state" in next_info:
+                current_game_states = next_obs.view(num_games, -1)
+            print("--- PHOENIX REBOOT COMPLETE ---")
+
         for step in range(0, args.num_steps):
             global_step += actual_num_envs
             obs[step] = next_obs
@@ -682,15 +611,14 @@ if __name__ == "__main__":
             if "global_state" in next_info:
                 # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
                 current_game_states = next_obs.view(num_games, -1)
+                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
+                states[step] = torch.cat([current_game_states, occupied], dim=-1)
             else:
                 # Fallback for Atari: Reshape current observations as the "God-view"
                 current_game_states = next_obs.view(num_games, -1)
-
-            landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-            landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-            occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
-            states[step] = torch.cat([current_game_states, occupied], dim=-1)
-            #states[step] = current_game_states
+                states[step] = current_game_states
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -740,16 +668,15 @@ if __name__ == "__main__":
                 # True global state for MPE
                 # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
                 final_state = next_obs.view(num_games, -1)
+                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
+                final_state = torch.cat([final_state, occupied], dim=-1)
             else:
                 # Fallback for Atari: Proxy state from observations
                 final_state = next_obs.view(num_games, -1)
 
-            landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-            landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-            occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
-            final_state = torch.cat([final_state, occupied], dim=-1)
-
-            next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
+            next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -904,6 +831,8 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+        if update % 1000 == 0:
+                gc.collect()
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
