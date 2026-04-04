@@ -43,13 +43,13 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=150000000,
+    parser.add_argument("--total-timesteps", type=int, default=100000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=32,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=4096,
+    parser.add_argument("--num-steps", type=int, default=2048,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -71,15 +71,15 @@ def parse_args():
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
     parser.add_argument("--ent-coef", type=float, default=0.03,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.75,
+    parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--num-landmarks", type=int, default=4,
+    parser.add_argument("--num-landmarks", type=int, default=3,
         help="number of agents and landmarks")
-    parser.add_argument("--max-cycles", type=int, default=150,
+    parser.add_argument("--max-cycles", type=int, default=100,
         help="length of environment run")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -316,12 +316,12 @@ class StateWrapper(BaseParallelWrapper):
         return obs, infos
 
 # 1. Base Environment Factory
-def make_env(env_id, seed):
+def make_env(env_id, seed, current_local_ratio=0.5):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
             env = simple_spread_v3.parallel_env(N=args.num_landmarks, max_cycles=args.max_cycles, 
-                                                local_ratio=0.5, dynamic_rescaling=True, render_mode="rgb_array")
+                                                local_ratio=current_local_ratio, dynamic_rescaling=True, render_mode="rgb_array")
             env = StateWrapper(env)
         else:
             env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
@@ -442,12 +442,12 @@ class DictInfoWrapper(gym.vector.VectorEnv):
     def close(self): 
         return self.env.close()
 
-def build_environments(args, run_name, base_seed):
-    temp_env = make_env(args.env_id, base_seed)()
+def build_environments(args, run_name, base_seed, current_local_ratio=0.5, update_step=0):
+    temp_env = make_env(args.env_id, base_seed, current_local_ratio)()
     num_agents_per_game = temp_env.num_envs
     num_games = args.num_envs // num_agents_per_game
 
-    env_list = [make_env(args.env_id, base_seed + i) for i in range(num_games)]
+    env_list = [make_env(args.env_id, base_seed + i, current_local_ratio) for i in range(num_games)]
     envs = ConcatVecEnv(env_list)
     envs = DictInfoWrapper(envs)
 
@@ -458,7 +458,8 @@ def build_environments(args, run_name, base_seed):
         envs = gym.wrappers.vector.RecordVideo(
             envs, 
             f"videos/{run_name}", 
-            episode_trigger=lambda x: x % 2000 == 0
+            episode_trigger=lambda x: x % 2000 == 0,
+            name_prefix=f"rl-video-update_{update_step}"
         )
 
     # Set Final CleanRL attributes
@@ -496,10 +497,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
     rng = np.random.default_rng(args.seed)
+    current_ratio = 0.1
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    envs, num_agents_per_game, num_games = build_environments(args, run_name, args.seed)
+    envs, num_agents_per_game, num_games = build_environments(args, run_name, args.seed, current_ratio, update_step=0)
     actual_num_envs = envs.num_envs
 
     # reward_norm = RewardNormalizer(actual_num_envs, args.gamma)
@@ -555,6 +557,7 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     dones = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
+    ent_coef_now = 0
 
     for update in range(1, num_updates + 1):
         # Annealing the rate if instructed to do so.
@@ -575,19 +578,26 @@ if __name__ == "__main__":
             # Then hold at 0 for the final 20% to "harden" the policy
             progress = (update - 1.0) / num_updates
             if progress < 0.85:
-                ent_coef_now = max(0.0001, args.ent_coef * (1.0 - progress / 0.8))
+                ent_coef_now = max(0.0001, args.ent_coef * (1.0 - progress / 0.85))
             else:
                 ent_coef_now = 0.0001
         else:
             ent_coef_now = args.ent_coef
 
-        if update % 1500 == 0:
+        if update % 100 == 0:
             print(f"--- UPDATE {update}: PERFORMING PHOENIX REBOOT OF ENVIRONMENTS ---")
             envs.close()
             
+            progress = (update - 1.0) / num_updates
+            if progress < 0.8:
+                # Starts at 0.1, grows to 0.5
+                current_ratio = 0.1 + (0.4 * (progress / 0.8))
+            else:
+                current_ratio = 0.5
+
             # Rebuild with a staggered seed so we don't repeat the exact same scenarios
             new_seed = args.seed + update 
-            envs, _, _ = build_environments(args, run_name, new_seed)
+            envs, _, _ = build_environments(args, run_name, new_seed, current_ratio, update_step=update)
             
             # Re-initialize the starting observations for PPO
             reset_data = envs.reset(seed=new_seed)
@@ -613,7 +623,7 @@ if __name__ == "__main__":
                 current_game_states = next_obs.view(num_games, -1)
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
+                occupied = (torch.norm(landmark_dist, dim=-1) < 0.15).any(dim=1).float()
                 states[step] = torch.cat([current_game_states, occupied], dim=-1)
             else:
                 # Fallback for Atari: Reshape current observations as the "God-view"
@@ -670,7 +680,7 @@ if __name__ == "__main__":
                 final_state = next_obs.view(num_games, -1)
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < 0.1).any(dim=1).float()
+                occupied = (torch.norm(landmark_dist, dim=-1) < 0.15).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
                 # Fallback for Atari: Proxy state from observations
@@ -831,7 +841,7 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-        if update % 1000 == 0:
+        if update % 500 == 0:
                 gc.collect()
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -849,6 +859,8 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar("charts/local_ratio", current_ratio, global_step)
+        writer.add_scalar("charts/ent_coef_now", ent_coef_now, global_step)
 
     envs.close()
     writer.close()
