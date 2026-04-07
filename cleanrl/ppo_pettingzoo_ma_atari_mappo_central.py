@@ -43,7 +43,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=100000000,
+    parser.add_argument("--total-timesteps", type=int, default=80000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -81,8 +81,6 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--max-cycles", type=int, default=100,
         help="length of environment run")
-    parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will have extra reward cheats")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -220,19 +218,17 @@ class Agent(nn.Module):
         # self.state_normalizer = ObservationNormalizer(state_dim)
 
         # HETEROGENEOUS ACTORS: Each agent ID gets its own unique brain
-        self.actors = nn.ModuleList([
-            nn.Sequential(
-                layer_init(nn.Linear(self.obs_dim, 512)),
-                nn.LayerNorm(512), nn.ReLU(),
-                layer_init(nn.Linear(512, 512)),
-                nn.LayerNorm(512), nn.ReLU(),
-                layer_init(nn.Linear(512, 256)),
-                nn.LayerNorm(256), nn.ReLU(),
-                layer_init(nn.Linear(256, 256)),
-                nn.ReLU(),
-                layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
-            ) for _ in range(num_agents)
-        ])
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(self.obs_dim + self.num_agents, 512)), # <-- Added self.num_agents
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+            layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+        )
 
         # SHARED CENTRALIZED CRITIC: One brain to judge the whole team
         concatenated_obs_dim = self.num_agents * self.obs_dim
@@ -277,15 +273,21 @@ class Agent(nn.Module):
         
         # Reshape to [NumGames, NumAgents, ObsDim]
         obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
+        num_games = obs_reshaped.shape[0]
         
-        logits_list = []
-        for i in range(self.num_agents):
-            # Each observation in the game is passed to its specific Actor
-            logits = self.actors[i](obs_reshaped[:, i, :])
-            logits_list.append(logits)
+        # --- NEW: Symmetry Breaking (One-Hot Encoding) ---
+        # Generate identity matrix for agent IDs: [NumAgents, NumAgents]
+        agent_ids = torch.eye(self.num_agents, device=x.device)
         
-        # Flatten back to [BatchSize, NumActions]
-        combined_logits = torch.stack(logits_list, dim=1).view(batch_size, -1)
+        # Expand to match the number of games: [NumGames, NumAgents, NumAgents]
+        agent_ids_expanded = agent_ids.unsqueeze(0).expand(num_games, -1, -1)
+        
+        # Concatenate observation with the Agent ID: [NumGames, NumAgents, ObsDim + NumAgents]
+        actor_input = torch.cat([obs_reshaped, agent_ids_expanded], dim=-1)
+        
+        # Flatten back to [BatchSize, ObsDim + NumAgents] and pass through shared actor
+        combined_logits = self.actor(actor_input.view(batch_size, -1))
+        
         probs = Categorical(logits=combined_logits)
         
         if action is None:
@@ -546,7 +548,7 @@ if __name__ == "__main__":
     # agent = Agent(envs).to(device)
     # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     optimizer = optim.Adam([
-            {'params': list(agent.actors.parameters()), 'lr': 3e-4}, 
+            {'params': list(agent.actor.parameters()), 'lr': 3e-4}, # <-- Removed the 's'
             {'params': list(agent.critic_encoder.parameters()) + 
                     list(agent.critic.parameters()) + 
                     list(agent.critic_projection.parameters()), 'lr': 1e-3} 
@@ -579,11 +581,11 @@ if __name__ == "__main__":
             progress = (update - 1.0) / num_updates
             
             # HOLD entropy steady while the environment gets harder
-            if progress < 0.7:
+            if progress < 0.8:
                 ent_coef_now = args.ent_coef 
             # DECAY rapidly only after the curriculum is finished to harden the policy
             else:
-                decay_progress = (progress - 0.7) / 0.2
+                decay_progress = (progress - 0.8) / 0.2
                 ent_coef_now = max(0.0001, args.ent_coef * (1.0 - decay_progress))
         else:
             ent_coef_now = args.ent_coef
@@ -593,12 +595,23 @@ if __name__ == "__main__":
             envs.close()
             
             progress = (update - 1.0) / num_updates
-            if progress < 0.7:
-                # Starts at 0.1, grows to 0.5
-                current_ratio = 0.1 + (0.4 * (progress / 0.7))
+
+            # 1. SYMMETRY BREAKING WINDOW (0% to 30%)
+            # Hold at 0.1 to let the Shared Actor learn the One-Hot IDs safely
+            if progress < 0.3:
+                current_ratio = 0.1
+                
+            # 2. SCALING PHASE (30% to 80%)
+            # Ramp up from 0.1 to 0.5 now that agents can steer independently
+            elif progress < 0.8:
+                scaling_progress = (progress - 0.3) / 0.5
+                current_ratio = 0.1 + (0.4 * scaling_progress)
+                
+            # 3. HARDENING PHASE (80% to 100%)
+            # Hold at max penalty
             else:
                 current_ratio = 0.5
-
+            
             # Rebuild with a staggered seed so we don't repeat the exact same scenarios
             new_seed = args.seed + update 
             envs, _, _ = build_environments(args, run_name, new_seed, current_ratio, update_step=update)
@@ -651,22 +664,8 @@ if __name__ == "__main__":
             else:
                 next_obs, reward, done, next_info = step_data
 
-            if args.reward_cheat:
-                next_obs_tensor = torch.Tensor(next_obs).to(device)
-                # --- NEW: EXPLICIT REWARD SHAPING ---
-                # 1. Calculate occupancy for the state the agents JUST landed in
-                new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                new_occupied = (torch.norm(new_landmark_dist, dim=-1) < 0.2).any(dim=1).float()
-                
-                # 2. Give the team a +0.1 bonus for EVERY landmark currently covered
-                occupancy_bonus = (new_occupied.sum(dim=1) * 0.1).repeat_interleave(num_agents_per_game)
-                
-                # 3. Add the bonus to the native PettingZoo reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + occupancy_bonus
-            else:
-                # normalized_step_rewards = reward_norm(reward, done)
-                rewards[step] = torch.tensor(reward).to(device).view(-1)
+            # normalized_step_rewards = reward_norm(reward, done)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             # LOGGING TEAM DATA
