@@ -43,7 +43,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=100000000,
+    parser.add_argument("--total-timesteps", type=int, default=70000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -79,7 +79,7 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--num-landmarks", type=int, default=3,
         help="number of agents and landmarks")
-    parser.add_argument("--max-cycles", type=int, default=100,
+    parser.add_argument("--max-cycles", type=int, default=70,
         help="length of environment run")
     parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will have extra reward cheats")
@@ -473,6 +473,7 @@ def build_environments(args, run_name, base_seed, current_local_ratio=0.5, updat
     return envs, num_agents_per_game, num_games
 
 if __name__ == "__main__":
+
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -492,6 +493,12 @@ if __name__ == "__main__":
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+
+    occupancy_threshold = {
+     3: 0.2,
+     4: 0.25,
+     5: 0.3   
+    }
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -627,7 +634,7 @@ if __name__ == "__main__":
                 current_game_states = next_obs.view(num_games, -1)
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < 0.3).any(dim=1).float()
+                occupied = (torch.norm(landmark_dist, dim=-1) < occupancy_threshold[args.num_landmarks]).any(dim=1).float()
                 states[step] = torch.cat([current_game_states, occupied], dim=-1)
             else:
                 # Fallback for Atari: Reshape current observations as the "God-view"
@@ -654,34 +661,44 @@ if __name__ == "__main__":
             if args.reward_cheat:
                 next_obs_tensor = torch.Tensor(next_obs).to(device)
                 
-                # 1. Extract relative (X, Y) coordinates of all landmarks for all agents
+                # Extract relative (X, Y) coordinates of all landmarks for all agents
                 new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
-                # 2. Calculate the distance from EACH agent to ALL landmarks
+                # Shape: [num_games, num_agents, num_landmarks]
                 dist = torch.norm(new_landmark_dist, dim=-1)
+                gravity_slope = (((args.num_landmarks - 1) * 0.5) / 0.15) + 0.1
                 
-                # 3. Find the distance to the CLOSEST landmark for each specific agent
-                min_dist, _ = dist.min(dim=-1)
+                # --- CHEAT 1: INDIVIDUAL TRACTOR BEAM ---
+                # Punish agents severely for staying far away from the cluster.
+                # This cures the sacrificial corner-hiding.
+                min_dist_per_agent, _ = dist.min(dim=-1)
+                # clamped_dist = torch.clamp(min_dist_per_agent, max=0.5)
+                # individual_pull = -clamped_dist * gravity_slope
+                individual_pull = -min_dist_per_agent * gravity_slope # ((args.num_landmarks - 1) * 0.5) / 0.15
                 
-                # --- NEW: GRADIENT REWARD CHEAT ---
-                threshold = 0.3
-                max_bonus = 2.5
-                # threshold 0.3 and 2.5 for N = 5
-                # threshold 0.25 and reward 2 for N=4
-                # threshold 0.2 and reward .1 for N=3
-                # Reward > (N - 1) * 0.5 -> round to higher .5 multiple
+                # pull (N - 1) * 0.5
+                # stronger pull (N-1)x).5/0.15
+                # massive reward (N) * 0.5 -> round to higher .5 multiple
+
+                # threshold 0.3, 0.25, 0.2
                 # Threshold = .15/sin(pi/N) -> round to higher .05 multiple
+
+                # --- CHEAT 2: GLOBAL COVERAGE MULTIPLIER ---
+                # Massive +3.0 reward for every UNIQUE landmark covered by anyone.
+                # This cures the dogpile and forces them to spread to all 5 targets.
+                # 3.0 is from max midpoint it needs to travel (simple spread is 2x2)
+                # profit_buffer is max collisions it must go though to reach landmark
+                max_travel_penalty = 3.0 * gravity_slope
+                profit_buffer = (args.num_landmarks * 0.6)
+                team_bonus_value = max_travel_penalty + profit_buffer
+
+                covered_landmarks = (dist < occupancy_threshold[args.num_landmarks]).any(dim=1).float()
+                team_coverage_bonus = (covered_landmarks.sum(dim=-1) * team_bonus_value).repeat_interleave(num_agents_per_game)
+                # team_coverage_bonus = (covered_landmarks.sum(dim=-1) * args.num_landmarks*0.5).repeat_interleave(num_agents_per_game)
                 
-                # 4. Calculate depth inside the threshold (0.0 at edge, 1.0 at center)
-                gradient_scale = torch.clamp((threshold - min_dist) / threshold, min=0.0, max=1.0)
-                
-                # 5. Multiply the scale by the maximum bonus
-                individual_bonus = gradient_scale * max_bonus
-                # ----------------------------------
-                
-                # 6. Flatten and add strictly to the respective agent's reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_bonus.view(-1)
+                # Combine the cheats with the native environment reward
+                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1) + team_coverage_bonus.view(-1)
             else:
                 # normalized_step_rewards = reward_norm(reward, done)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -716,7 +733,7 @@ if __name__ == "__main__":
                 final_state = next_obs.view(num_games, -1)
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < 0.3).any(dim=1).float()
+                occupied = (torch.norm(landmark_dist, dim=-1) < occupancy_threshold[args.num_landmarks]).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
                 # Fallback for Atari: Proxy state from observations
