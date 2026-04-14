@@ -659,46 +659,49 @@ if __name__ == "__main__":
                 next_obs, reward, done, next_info = step_data
 
             if args.reward_cheat:
+                agent_radius = 0.15
+                collision_penalty = 0.5
+                politeness_factor = 0.6
+
                 next_obs_tensor = torch.Tensor(next_obs).to(device)
                 
-                # Extract relative (X, Y) coordinates of all landmarks for all agents
+                # Extract relative (X, Y) coordinates of all landmarks
                 new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
                 # Shape: [num_games, num_agents, num_landmarks]
                 dist = torch.norm(new_landmark_dist, dim=-1)
-                gravity_slope = (((args.num_landmarks - 1) * 0.5) / 0.15) + 0.1
                 
-                # --- CHEAT 1: INDIVIDUAL TRACTOR BEAM ---
-                # Punish agents severely for staying far away from the cluster.
-                # This cures the sacrificial corner-hiding.
-                min_dist_per_agent, _ = dist.min(dim=-1)
-                # clamped_dist = torch.clamp(min_dist_per_agent, max=0.5)
-                # individual_pull = -clamped_dist * gravity_slope
-                individual_pull = -min_dist_per_agent * gravity_slope # ((args.num_landmarks - 1) * 0.5) / 0.15
+                # --- YOUR DYNAMIC GREEDY ASSIGNMENT ---
+                dist_clone = dist.clone()
+                assigned_dist = torch.zeros(num_games, num_agents_per_game).to(device)
+                game_idx = torch.arange(num_games).to(device)
                 
-                # pull (N - 1) * 0.5
-                # stronger pull (N-1)x).5/0.15
-                # massive reward (N) * 0.5 -> round to higher .5 multiple
-
-                # threshold 0.3, 0.25, 0.2
-                # Threshold = .15/sin(pi/N) -> round to higher .05 multiple
-
-                # --- CHEAT 2: GLOBAL COVERAGE MULTIPLIER ---
-                # Massive +3.0 reward for every UNIQUE landmark covered by anyone.
-                # This cures the dogpile and forces them to spread to all 5 targets.
-                # 3.0 is from max midpoint it needs to travel (simple spread is 2x2)
-                # profit_buffer is max collisions it must go though to reach landmark
-                max_travel_penalty = 3.0 * gravity_slope
-                profit_buffer = (args.num_landmarks * 0.6)
-                team_bonus_value = max_travel_penalty + profit_buffer
-
-                covered_landmarks = (dist < occupancy_threshold[args.num_landmarks]).any(dim=1).float()
-                team_coverage_bonus = (covered_landmarks.sum(dim=-1) * team_bonus_value).repeat_interleave(num_agents_per_game)
-                # team_coverage_bonus = (covered_landmarks.sum(dim=-1) * args.num_landmarks*0.5).repeat_interleave(num_agents_per_game)
+                # Iteratively pair the closest unassigned Agent and Landmark
+                for _ in range(args.num_landmarks):
+                    # 1. Find the absolute shortest distance currently available in each game
+                    flat_dist = dist_clone.view(num_games, -1)
+                    min_vals, min_idx = flat_dist.min(dim=1)
+                    
+                    # 2. Convert the flat index back to (Agent_ID, Landmark_ID)
+                    agent_idx = min_idx // args.num_landmarks
+                    landmark_idx = min_idx % args.num_landmarks
+                    
+                    # 3. Record this distance for the specific assigned agent
+                    assigned_dist[game_idx, agent_idx] = min_vals
+                    
+                    # 4. Mask out this Agent and Landmark so they cannot be selected again
+                    dist_clone[game_idx, agent_idx, :] = float('inf')
+                    dist_clone[game_idx, :, landmark_idx] = float('inf')
                 
-                # Combine the cheats with the native environment reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1) + team_coverage_bonus.view(-1)
+                # Calculate the exact slope needed to overpower a max-density collision
+                bulldozer_threshold = collision_penalty / agent_radius
+                gravity_slope = bulldozer_threshold * politeness_factor
+                
+                # Pull each agent exclusively toward its dynamically assigned, unique landmark
+                individual_pull = -assigned_dist * gravity_slope 
+                
+                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
             else:
                 # normalized_step_rewards = reward_norm(reward, done)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
