@@ -569,6 +569,8 @@ if __name__ == "__main__":
     ent_coef_now = 0
 
     for update in range(1, num_updates + 1):
+        current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
+        needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -661,46 +663,55 @@ if __name__ == "__main__":
             if args.reward_cheat:
                 agent_radius = 0.15
                 collision_penalty = 0.5
-                politeness_factor = 0.6
-
-                next_obs_tensor = torch.Tensor(next_obs).to(device)
                 
-                # Extract relative (X, Y) coordinates of all landmarks
+                next_obs_tensor = torch.Tensor(next_obs).to(device)
                 new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
                 # Shape: [num_games, num_agents, num_landmarks]
                 dist = torch.norm(new_landmark_dist, dim=-1)
                 
-                # --- YOUR DYNAMIC GREEDY ASSIGNMENT ---
-                dist_clone = dist.clone()
-                assigned_dist = torch.zeros(num_games, num_agents_per_game).to(device)
-                game_idx = torch.arange(num_games).to(device)
+                # --- 1. EPISODIC STATIC ASSIGNMENT ---
+                # Check which games just reset (or are at step 0)
+                game_dones = torch.Tensor(done).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
+                needs_assignment = needs_assignment | game_dones
                 
-                # Iteratively pair the closest unassigned Agent and Landmark
-                for _ in range(args.num_landmarks):
-                    # 1. Find the absolute shortest distance currently available in each game
-                    flat_dist = dist_clone.view(num_games, -1)
-                    min_vals, min_idx = flat_dist.min(dim=1)
+                # If any game reset, recalculate its optimal shortest-path routing
+                if needs_assignment.any():
+                    dist_clone = dist.clone()
                     
-                    # 2. Convert the flat index back to (Agent_ID, Landmark_ID)
-                    agent_idx = min_idx // args.num_landmarks
-                    landmark_idx = min_idx % args.num_landmarks
-                    
-                    # 3. Record this distance for the specific assigned agent
-                    assigned_dist[game_idx, agent_idx] = min_vals
-                    
-                    # 4. Mask out this Agent and Landmark so they cannot be selected again
-                    dist_clone[game_idx, agent_idx, :] = float('inf')
-                    dist_clone[game_idx, :, landmark_idx] = float('inf')
+                    # Only calculate for games that need it
+                    for g in range(num_games):
+                        if needs_assignment[g]:
+                            for _ in range(args.num_landmarks):
+                                flat_dist = dist_clone[g].view(-1)
+                                min_val, min_idx = flat_dist.min(dim=0)
+                                
+                                agent_idx = min_idx // args.num_landmarks
+                                landmark_idx = min_idx % args.num_landmarks
+                                
+                                current_assignments[g, agent_idx] = landmark_idx
+                                
+                                dist_clone[g, agent_idx, :] = float('inf')
+                                dist_clone[g, :, landmark_idx] = float('inf')
+                                
+                    needs_assignment.fill_(False)
                 
-                # Calculate the exact slope needed to overpower a max-density collision
-                bulldozer_threshold = collision_penalty / agent_radius
-                gravity_slope = bulldozer_threshold * politeness_factor
+                # Extract the distance to the frozen, optimally assigned target
+                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
                 
-                # Pull each agent exclusively toward its dynamically assigned, unique landmark
-                individual_pull = -assigned_dist * gravity_slope 
+                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
+                # Calculate the mathematical tipping point for the dead-center snap
+                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
                 
+                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
+                snap_factor = 1.5 
+                procedural_multiplier = min_snap_multiplier * snap_factor
+                
+                # R = -M * sqrt(d)
+                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
+                
+                # Combine with native environment reward
                 rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
             else:
                 # normalized_step_rewards = reward_norm(reward, done)
@@ -917,6 +928,11 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         writer.add_scalar("charts/local_ratio", current_ratio, global_step)
         writer.add_scalar("charts/ent_coef_now", ent_coef_now, global_step)
+
+        if update % 100 == 0 or update == num_updates:
+            save_dir = f"models/{run_name}"
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save(agent.state_dict(), f"{save_dir}/{update}_model.pth")
 
     envs.close()
     writer.close()
