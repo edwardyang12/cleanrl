@@ -1,4 +1,5 @@
 import torch
+from tqdm import tqdm
 import numpy as np
 import pickle
 import os
@@ -34,7 +35,7 @@ def harvest_dataset(N, num_trajectories=1000):
     # 2. Load Oracle
     state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
     oracle = Agent(envs, num_agents_per_game, state_dim).to(device)
-    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777531791/1139_model.pth")) # Ensure path points to your saved model
+    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777572871/1068_model.pth")) # Ensure path points to your saved model
     oracle.eval() # Lock batchnorm/dropout
 
     expert_obs = []
@@ -44,7 +45,7 @@ def harvest_dataset(N, num_trajectories=1000):
     
     print(f"Harvesting {num_trajectories} steps for N={N}...")
     with torch.no_grad():
-        for step in range(num_trajectories):
+        for step in tqdm(range(num_trajectories)):
             obs_reshaped = next_obs.view(-1, num_agents_per_game, oracle.obs_dim)
             
             actions_list = []
@@ -80,5 +81,5 @@ def harvest_dataset(N, num_trajectories=1000):
 
 if __name__ == "__main__":
     # Ensure you update the model path inside the function before running
-    for N in [3]:
+    for N in [4]:
         harvest_dataset(N, num_trajectories=500000)
