@@ -318,7 +318,7 @@ class StateWrapper(BaseParallelWrapper):
         return obs, infos
 
 # 1. Base Environment Factory
-def make_env(env_id, seed, current_local_ratio=0.5):
+def make_env(args, env_id, seed, current_local_ratio=0.5):
     def thunk():
         if "simple_spread" in env_id:
             from mpe2 import simple_spread_v3
@@ -445,11 +445,11 @@ class DictInfoWrapper(gym.vector.VectorEnv):
         return self.env.close()
 
 def build_environments(args, run_name, base_seed, current_local_ratio=0.5, update_step=0):
-    temp_env = make_env(args.env_id, base_seed, current_local_ratio)()
+    temp_env = make_env(args, args.env_id, base_seed, current_local_ratio)()
     num_agents_per_game = temp_env.num_envs
     num_games = args.num_envs // num_agents_per_game
 
-    env_list = [make_env(args.env_id, base_seed + i, current_local_ratio) for i in range(num_games)]
+    env_list = [make_env(args, args.env_id, base_seed + i, current_local_ratio) for i in range(num_games)]
     envs = ConcatVecEnv(env_list)
     envs = DictInfoWrapper(envs)
 
