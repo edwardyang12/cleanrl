@@ -52,7 +52,7 @@ def train_behavioral_cloning():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print("Loading Expert Datasets...")
-    full_dataset = ExpertDataset(n_values=[3])
+    full_dataset = ExpertDataset(n_values=[5])
     
     # --- 1. TRAIN / VALIDATION SPLIT ---
     # Standard 80/20 split

@@ -606,7 +606,7 @@ if __name__ == "__main__":
     #                 list(agent.critic_projection.parameters()), 'lr': 1e-3} 
     #     ], eps=1e-5)
     
-    agent.load_bc_weights("expert_data/student_bc_best_3.pt")
+    agent.load_bc_weights("expert_data/student_bc_best_5.pt")
 
     # behavorial clone optimizer
     optimizer = optim.Adam([

@@ -4,6 +4,7 @@ import numpy as np
 import pickle
 import os
 import gymnasium as gym
+from torch.distributions.categorical import Categorical
 
 # Import your environment builder and Agent class from your main script
 from ppo_pettingzoo_ma_atari_mappo import build_environments, Agent, parse_args
@@ -35,7 +36,7 @@ def harvest_dataset(N, num_trajectories=1000):
     # 2. Load Oracle
     state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
     oracle = Agent(envs, num_agents_per_game, state_dim).to(device)
-    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777572871/1068_model.pth")) # Ensure path points to your saved model
+    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777593182/1139_model.pth")) # Ensure path points to your saved model
     oracle.eval() # Lock batchnorm/dropout
 
     expert_obs = []
@@ -46,18 +47,34 @@ def harvest_dataset(N, num_trajectories=1000):
     print(f"Harvesting {num_trajectories} steps for N={N}...")
     with torch.no_grad():
         for step in tqdm(range(num_trajectories)):
-            obs_reshaped = next_obs.view(-1, num_agents_per_game, oracle.obs_dim)
+            
+            # --- FIX 1: THE PRECISION ALIGNMENT ---
+            # We must pass the exact normalized matrix the Oracle was trained on
+            normalized_obs = oracle.obs_normalizer.normalize(next_obs)
+            obs_reshaped = normalized_obs.view(-1, num_agents_per_game, oracle.obs_dim)
             
             actions_list = []
             for i in range(num_agents_per_game):
                 logits = oracle.actors[i](obs_reshaped[:, i, :])
+                
                 # PURE EXPLOITATION: No categorical sampling
-                deterministic_action = torch.argmax(logits, dim=-1) 
-                actions_list.append(deterministic_action)
+                # deterministic_action = torch.argmax(logits, dim=-1) 
+                # actions_list.append(deterministic_action)
+
+                # --- FIX 2: TEMPERATURE-SCALED JITTER ---
+                # A fully converged N=5 policy has such extreme logits that sample() 
+                # practically acts like argmax. We divide by a temperature to slightly 
+                # soften the distribution, guaranteeing the micro-jitter needed to break deadlocks.
+                temperature = 1.25 
+                probs = Categorical(logits=logits / temperature)
+                sampled_action = probs.sample() 
+                
+                actions_list.append(sampled_action)
             
             action = torch.stack(actions_list, dim=1).view(-1)
             
-            # Save raw numpy arrays for the dataset
+            # Save the RAW (unnormalized) observations so the student network 
+            # learns to master the native environment.
             expert_obs.append(next_obs.cpu().numpy())
             expert_actions.append(action.cpu().numpy())
             
@@ -81,5 +98,5 @@ def harvest_dataset(N, num_trajectories=1000):
 
 if __name__ == "__main__":
     # Ensure you update the model path inside the function before running
-    for N in [4]:
+    for N in [5]:
         harvest_dataset(N, num_trajectories=500000)
