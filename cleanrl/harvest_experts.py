@@ -3,13 +3,14 @@ from tqdm import tqdm
 import numpy as np
 import pickle
 import os
+import gc
 import gymnasium as gym
 from torch.distributions.categorical import Categorical
 
 # Import your environment builder and Agent class from your main script
 from ppo_pettingzoo_ma_atari_mappo import build_environments, Agent, parse_args
 
-def harvest_dataset(N, num_trajectories=1000):
+def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
     args = parse_args()
     args.num_landmarks = N
     args.reward_cheat = False # Turn off the cheat; we just want the physical state
@@ -36,15 +37,18 @@ def harvest_dataset(N, num_trajectories=1000):
     # 2. Load Oracle
     state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
     oracle = Agent(envs, num_agents_per_game, state_dim).to(device)
-    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777593182/1139_model.pth")) # Ensure path points to your saved model
+    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777972083/1139_model.pth")) # Ensure path points to your saved model
     oracle.eval() # Lock batchnorm/dropout
 
     expert_obs = []
     expert_actions = []
+    chunk_idx = 0
 
     next_obs = torch.Tensor(envs.reset(seed=args.seed)[0]).to(device)
     
-    print(f"Harvesting {num_trajectories} steps for N={N}...")
+    print(f"Harvesting {num_trajectories} steps for N={N} in chunks of {chunk_size}...")
+    os.makedirs("expert_data", exist_ok=True)
+
     with torch.no_grad():
         for step in tqdm(range(num_trajectories)):
             
@@ -77,26 +81,41 @@ def harvest_dataset(N, num_trajectories=1000):
             # learns to master the native environment.
             expert_obs.append(next_obs.cpu().numpy())
             expert_actions.append(action.cpu().numpy())
+
+            if len(expert_obs) >= chunk_size:
+                dataset = {
+                    "observations": np.vstack(expert_obs), 
+                    "actions": np.concatenate(expert_actions) 
+                }
+                save_path = f"expert_data/expert_N{N}_part{chunk_idx}.pkl"
+                with open(save_path, "wb") as f:
+                    pickle.dump(dataset, f)
+                print(f"\n[Memory Check] Saved {save_path}. Clearing RAM...")
+                
+                # Nuke the lists from RAM and force garbage collection
+                expert_obs.clear()
+                expert_actions.clear()
+                gc.collect()
+                
+                chunk_idx += 1
             
             step_data = envs.step(action.cpu().numpy())
             next_obs = torch.Tensor(step_data[0] if len(step_data) == 5 else step_data[0]).to(device)
 
-        if step % 1000 == 0:
-            print(step)
-
     # 3. Save to disk
-    dataset = {
-        "observations": np.vstack(expert_obs), 
-        "actions": np.concatenate(expert_actions) 
-    }
-    
-    os.makedirs("expert_data", exist_ok=True)
-    with open(f"expert_data/expert_N{N}.pkl", "wb") as f:
-        pickle.dump(dataset, f)
-    print(f"Successfully saved N={N} dataset!")
+    if len(expert_obs) > 0:
+        dataset = {
+            "observations": np.vstack(expert_obs), 
+            "actions": np.concatenate(expert_actions) 
+        }
+        with open(f"expert_data/expert_N{N}_part{chunk_idx}.pkl", "wb") as f:
+            pickle.dump(dataset, f)
+        print(f"\n[Memory Check] Saved final remainder chunk to part{chunk_idx}.")
+
+    print(f"Successfully finished harvesting N={N}!")
     envs.close()
 
 if __name__ == "__main__":
     # Ensure you update the model path inside the function before running
-    for N in [5]:
-        harvest_dataset(N, num_trajectories=500000)
+    for N in [6]:
+        harvest_dataset(N, num_trajectories=500000, chunk_size=200000)

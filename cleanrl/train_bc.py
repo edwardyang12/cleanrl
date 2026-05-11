@@ -4,6 +4,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 import pickle
+import glob
 from tqdm import tqdm
 
 class ExpertDataset(Dataset):
@@ -12,14 +13,19 @@ class ExpertDataset(Dataset):
         all_actions = []
         
         for N in n_values:
-            with open(f"expert_data/expert_N{N}.pkl", "rb") as f:
-                data = pickle.load(f)
+            # Use glob to find all parts for this N value
+            file_pattern = f"expert_data/expert_N{N}*.pkl"
+            part_files = glob.glob(file_pattern)
+            
+            if not part_files:
+                print(f"Warning: No files found for N={N}")
+                continue
                 
-                # SuperSuit already flattened the array. Reshaping it shreds the columns.
-                obs_reshaped = data["observations"]
-                
-                all_obs.append(obs_reshaped)
-                all_actions.append(data["actions"].flatten())
+            for file_path in part_files:
+                with open(file_path, "rb") as f:
+                    data = pickle.load(f)
+                    all_obs.append(data["observations"])
+                    all_actions.append(data["actions"].flatten())
                 
         self.obs = torch.Tensor(np.vstack(all_obs))
         self.actions = torch.LongTensor(np.concatenate(all_actions))
@@ -52,7 +58,7 @@ def train_behavioral_cloning():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print("Loading Expert Datasets...")
-    full_dataset = ExpertDataset(n_values=[5])
+    full_dataset = ExpertDataset(n_values=[6])
     
     # --- 1. TRAIN / VALIDATION SPLIT ---
     # Standard 80/20 split
@@ -63,9 +69,9 @@ def train_behavioral_cloning():
     generator = torch.Generator().manual_seed(42) 
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
     
-    train_loader = DataLoader(train_dataset, batch_size=32768, shuffle=True, num_workers=16, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=32768, shuffle=True, num_workers=4, pin_memory=True)
     # Validation loader doesn't need to be shuffled
-    val_loader = DataLoader(val_dataset, batch_size=32768, shuffle=False, num_workers=16, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=32768, shuffle=False, num_workers=4, pin_memory=True)
     
     print(f"Dataset Split: {train_size} Train | {val_size} Validation")
     

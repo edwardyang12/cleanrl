@@ -494,11 +494,7 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    occupancy_threshold = {
-     3: 0.2,
-     4: 0.25,
-     5: 0.3   
-    }
+    strict_occupancy_radius = 0.2
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -636,7 +632,7 @@ if __name__ == "__main__":
                 current_game_states = next_obs.view(num_games, -1)
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < occupancy_threshold[args.num_landmarks]).any(dim=1).float()
+                occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 states[step] = torch.cat([current_game_states, occupied], dim=-1)
             else:
                 # Fallback for Atari: Reshape current observations as the "God-view"
@@ -747,7 +743,7 @@ if __name__ == "__main__":
                 final_state = next_obs.view(num_games, -1)
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < occupancy_threshold[args.num_landmarks]).any(dim=1).float()
+                occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
                 # Fallback for Atari: Proxy state from observations
